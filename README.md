@@ -5,6 +5,33 @@
 - [中文源码分析](README.zh.md)
 - [English Source Analysis](README.en.md)
 
+## Quickstart (Local)
+
+This repository contains a self-contained baseline implementation.
+
+1) Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+2) Prepare data
+
+The official training environment provides the dataset directory and output
+paths via environment variables.
+
+For local runs, you must point `--data_dir` (or `TRAIN_DATA_PATH`) to a
+directory that contains **parquet shards** and a **schema.json**.
+
+3) Run training
+
+```bash
+bash run.sh --data_dir /path/to/official_dataset_dir
+```
+
+> Note: `demo_1000.parquet` is for quick inspection only; it is not guaranteed
+> to include the full training directory layout (e.g., `schema.json`).
+
 ## Introduction
 
 **Towards Unifying Sequence Modeling and Feature Interaction for Large-scale Recommendation**

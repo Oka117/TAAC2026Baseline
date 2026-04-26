@@ -202,11 +202,26 @@ def parse_args() -> argparse.Namespace:
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
     args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
 
+    # Friendly defaults for local runs.
+    # (On the official platform these are injected via env vars.)
+    if args.ckpt_dir is None:
+        args.ckpt_dir = os.path.join(os.getcwd(), 'outputs', 'ckpt')
+    if args.log_dir is None:
+        args.log_dir = os.path.join(os.getcwd(), 'outputs', 'log')
+    if args.tf_events_dir is None:
+        args.tf_events_dir = os.path.join(os.getcwd(), 'outputs', 'events')
+
     return args
 
 
 def main() -> None:
     args = parse_args()
+
+    if not args.data_dir:
+        raise SystemExit(
+            "Missing --data_dir (or env TRAIN_DATA_PATH). "
+            "Expected a directory that contains parquet shards and schema.json."
+        )
 
     # Create output directories.
     Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
