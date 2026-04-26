@@ -196,13 +196,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_token_gnn', action='store_true', default=False,
                         help='Enable GNN-NS: a lightweight TokenGNN over '
                              'non-sequential tokens after NS tokenization')
-    parser.add_argument('--token_gnn_layers', type=int, default=1,
+    parser.add_argument('--token_gnn_layers', type=int, default=2,
                         help='Number of TokenGNN layers over NS tokens '
-                             '(recommended: 1 for low-risk GNN-NS)')
+                             '(recommended: 2 for the stable GNN-NS variant)')
     parser.add_argument('--token_gnn_graph', type=str, default='full',
                         choices=['full'],
                         help='Graph structure for TokenGNN; full = complete '
                              'graph among NS tokens')
+    parser.add_argument('--token_gnn_layer_scale', type=float, default=0.1,
+                        help='Initial residual scale for each TokenGNN layer; '
+                             'smaller values keep the model closer to baseline')
 
     args = parser.parse_args()
 
@@ -314,6 +317,7 @@ def main() -> None:
         "use_token_gnn": args.use_token_gnn,
         "token_gnn_layers": args.token_gnn_layers,
         "token_gnn_graph": args.token_gnn_graph,
+        "token_gnn_layer_scale": args.token_gnn_layer_scale,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -327,7 +331,8 @@ def main() -> None:
         f"d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}, "
         f"use_token_gnn={args.use_token_gnn}, "
         f"token_gnn_layers={args.token_gnn_layers}, "
-        f"token_gnn_graph={args.token_gnn_graph}")
+        f"token_gnn_graph={args.token_gnn_graph}, "
+        f"token_gnn_layer_scale={args.token_gnn_layer_scale}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

@@ -1198,14 +1198,21 @@ class TokenGNNLayer(nn.Module):
     add field-to-field relational smoothing before the existing HyFormer stack.
     """
 
-    def __init__(self, d_model: int, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        dropout: float = 0.0,
+        layer_scale_init: float = 0.1,
+    ) -> None:
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.self_proj = nn.Linear(d_model, d_model)
         self.neigh_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        self.post_norm = nn.LayerNorm(d_model)
+        # Small residual scaling keeps GNN-NS close to the baseline at the
+        # start of training, which is safer when stacking multiple GNN layers.
+        self.layer_scale = nn.Parameter(torch.full((d_model,), layer_scale_init))
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """Runs one complete-graph update over tokens.
@@ -1229,29 +1236,34 @@ class TokenGNNLayer(nn.Module):
 
         msg = self.self_proj(x) + self.neigh_proj(neigh)
         delta = self.out_proj(F.silu(msg))
-        return self.post_norm(tokens + self.dropout(delta))
+        return tokens + self.dropout(delta) * self.layer_scale
 
 
 class TokenGNN(nn.Module):
     """Small GNN block applied only to non-sequential tokens.
 
-    The current experiment is GNN-NS: one layer, fully connected graph, placed
+    The current experiment is GNN-NS: two layers, fully connected graph, placed
     immediately after NS token construction and before query generation.
     """
 
     def __init__(
         self,
         d_model: int,
-        num_layers: int = 1,
+        num_layers: int = 2,
         dropout: float = 0.0,
         graph_type: str = 'full',
+        layer_scale_init: float = 0.1,
     ) -> None:
         super().__init__()
         if graph_type != 'full':
             raise ValueError(f"Unsupported TokenGNN graph_type={graph_type}; only 'full' is supported")
         self.graph_type = graph_type
         self.layers = nn.ModuleList([
-            TokenGNNLayer(d_model=d_model, dropout=dropout)
+            TokenGNNLayer(
+                d_model=d_model,
+                dropout=dropout,
+                layer_scale_init=layer_scale_init,
+            )
             for _ in range(max(0, num_layers))
         ])
 
@@ -1303,8 +1315,9 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # Optional GNN over non-sequential tokens
         use_token_gnn: bool = False,
-        token_gnn_layers: int = 1,
+        token_gnn_layers: int = 2,
         token_gnn_graph: str = 'full',
+        token_gnn_layer_scale: float = 0.1,
     ) -> None:
         super().__init__()
 
@@ -1402,6 +1415,7 @@ class PCVRHyFormer(nn.Module):
                 num_layers=token_gnn_layers,
                 dropout=dropout_rate,
                 graph_type=token_gnn_graph,
+                layer_scale_init=token_gnn_layer_scale,
             )
         else:
             self.token_gnn = nn.Identity()
