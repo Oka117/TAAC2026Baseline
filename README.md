@@ -5,6 +5,40 @@
 - [中文源码分析](README.zh.md)
 - [English Source Analysis](README.en.md)
 
+## Quickstart (Local)
+
+1) Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+2) Prepare data
+
+For local runs, point `--data_dir` (or `TRAIN_DATA_PATH`) to a directory that
+contains parquet shards and a `schema.json`.
+
+3) Run training
+
+```bash
+bash run.sh --data_dir /path/to/official_dataset_dir
+```
+
+### Smoke test with the official 1k-row sample (HuggingFace)
+
+If you just want to sanity-check the training loop locally, run the smoke test
+on the official sample dataset `TAAC2026/data_sample_1000`:
+
+```bash
+bash smoke_test_hf_sample.sh
+```
+
+This downloads `demo_1000.parquet` and generates a *debug-only* `schema.json`
+derived from the 1k-row sample.
+
+> The generated `schema.json` does NOT reflect the official vocab sizes and is
+> only intended for local smoke tests.
+
 ## Introduction
 
 **Towards Unifying Sequence Modeling and Feature Interaction for Large-scale Recommendation**
