@@ -2,12 +2,18 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
+# ---- Active config: RankMixer NS tokenizer + low-risk GNN-NS ----
+# GNN-NS places a 1-layer fully-connected TokenGNN after NS token construction.
+# It should be a small, low-risk change: modestly slower training, with AUC
+# expected to improve slightly or stay close to the baseline.
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
+    --use_token_gnn \
+    --token_gnn_layers 1 \
+    --token_gnn_graph full \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

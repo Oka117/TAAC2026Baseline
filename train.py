@@ -193,6 +193,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--use_token_gnn', action='store_true', default=False,
+                        help='Enable GNN-NS: a lightweight TokenGNN over '
+                             'non-sequential tokens after NS tokenization')
+    parser.add_argument('--token_gnn_layers', type=int, default=1,
+                        help='Number of TokenGNN layers over NS tokens '
+                             '(recommended: 1 for low-risk GNN-NS)')
+    parser.add_argument('--token_gnn_graph', type=str, default='full',
+                        choices=['full'],
+                        help='Graph structure for TokenGNN; full = complete '
+                             'graph among NS tokens')
 
     args = parser.parse_args()
 
@@ -301,6 +311,9 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_token_gnn": args.use_token_gnn,
+        "token_gnn_layers": args.token_gnn_layers,
+        "token_gnn_graph": args.token_gnn_graph,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -309,7 +322,12 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, "
+        f"d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}, "
+        f"use_token_gnn={args.use_token_gnn}, "
+        f"token_gnn_layers={args.token_gnn_layers}, "
+        f"token_gnn_graph={args.token_gnn_graph}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

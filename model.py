@@ -1189,6 +1189,78 @@ class RankMixerNSTokenizer(nn.Module):
         return torch.cat(tokens, dim=1)  # (B, num_ns_tokens, d_model)
 
 
+class TokenGNNLayer(nn.Module):
+    """One fully-connected message-passing layer over token nodes.
+
+    This layer is intentionally lightweight: NS tokens form a complete graph,
+    each token receives the mean representation of all other NS tokens, and a
+    residual FFN-style update writes the result back. It is a low-risk way to
+    add field-to-field relational smoothing before the existing HyFormer stack.
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(d_model)
+        self.self_proj = nn.Linear(d_model, d_model)
+        self.neigh_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.post_norm = nn.LayerNorm(d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Runs one complete-graph update over tokens.
+
+        Args:
+            tokens: NS tokens of shape (B, N, D).
+
+        Returns:
+            Updated tokens with the same shape.
+        """
+        B, N, D = tokens.shape
+        x = self.norm(tokens)
+
+        if N > 1:
+            # Fully connected graph without self-loops: each token aggregates
+            # the mean of all other NS tokens in the same sample.
+            neigh = (x.sum(dim=1, keepdim=True) - x) / float(N - 1)
+        else:
+            # Degenerate but safe path for ablations with a single NS token.
+            neigh = x
+
+        msg = self.self_proj(x) + self.neigh_proj(neigh)
+        delta = self.out_proj(F.silu(msg))
+        return self.post_norm(tokens + self.dropout(delta))
+
+
+class TokenGNN(nn.Module):
+    """Small GNN block applied only to non-sequential tokens.
+
+    The current experiment is GNN-NS: one layer, fully connected graph, placed
+    immediately after NS token construction and before query generation.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        graph_type: str = 'full',
+    ) -> None:
+        super().__init__()
+        if graph_type != 'full':
+            raise ValueError(f"Unsupported TokenGNN graph_type={graph_type}; only 'full' is supported")
+        self.graph_type = graph_type
+        self.layers = nn.ModuleList([
+            TokenGNNLayer(d_model=d_model, dropout=dropout)
+            for _ in range(max(0, num_layers))
+        ])
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            tokens = layer(tokens)
+        return tokens
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1229,6 +1301,10 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Optional GNN over non-sequential tokens
+        use_token_gnn: bool = False,
+        token_gnn_layers: int = 1,
+        token_gnn_graph: str = 'full',
     ) -> None:
         super().__init__()
 
@@ -1244,6 +1320,7 @@ class PCVRHyFormer(nn.Module):
         self.emb_skip_threshold = emb_skip_threshold
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.use_token_gnn = use_token_gnn
 
         # ================== NS Tokens Construction ==================
 
@@ -1314,6 +1391,20 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
+
+        # ================== GNN-NS: optional TokenGNN over NS tokens ==================
+        # Position: after NS token construction, before query generation. This
+        # keeps sequence modeling untouched while allowing user/item/dense NS
+        # tokens to exchange information through a complete graph.
+        if use_token_gnn and token_gnn_layers > 0:
+            self.token_gnn = TokenGNN(
+                d_model=d_model,
+                num_layers=token_gnn_layers,
+                dropout=dropout_rate,
+                graph_type=token_gnn_graph,
+            )
+        else:
+            self.token_gnn = nn.Identity()
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1581,6 +1672,28 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
+        """Builds non-sequential tokens and optionally applies GNN-NS.
+
+        TokenGNN is applied after all user/item/dense NS tokens are available,
+        so it can model field-level relations without changing the baseline
+        sequence encoders or query/token counts.
+        """
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+
+        ns_parts = [user_ns]
+        if self.has_user_dense:
+            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
+            ns_parts.append(user_dense_tok)
+        ns_parts.append(item_ns)
+        if self.has_item_dense:
+            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
+            ns_parts.append(item_dense_tok)
+
+        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        return self.token_gnn(ns_tokens)
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1633,20 +1746,8 @@ class PCVRHyFormer(nn.Module):
 
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
-        # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        # 1. NS tokens: tokenizer output followed by optional GNN-NS.
+        ns_tokens = self._build_ns_tokens(inputs)
 
         # 2. Embed each sequence domain (dynamic)
         seq_tokens_list = []
@@ -1676,20 +1777,8 @@ class PCVRHyFormer(nn.Module):
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
-        # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
-
-        ns_parts = [user_ns]
-        if self.has_user_dense:
-            user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
-            ns_parts.append(user_dense_tok)
-        ns_parts.append(item_ns)
-        if self.has_item_dense:
-            item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
-            ns_parts.append(item_dense_tok)
-
-        ns_tokens = torch.cat(ns_parts, dim=1)
+        # Reuses forward logic with deterministic dropout behavior from eval().
+        ns_tokens = self._build_ns_tokens(inputs)
 
         seq_tokens_list = []
         seq_masks_list = []
