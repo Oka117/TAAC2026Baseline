@@ -1242,7 +1242,7 @@ class TokenGNNLayer(nn.Module):
 class TokenGNN(nn.Module):
     """Small GNN block applied only to non-sequential tokens.
 
-    The current experiment is GNN-NS: two layers, fully connected graph, placed
+    The current experiment is GNN-NS: four layers, fully connected graph, placed
     immediately after NS token construction and before query generation.
     """
 
@@ -1315,7 +1315,7 @@ class PCVRHyFormer(nn.Module):
         item_ns_tokens: int = 0,
         # Optional GNN over non-sequential tokens
         use_token_gnn: bool = False,
-        token_gnn_layers: int = 2,
+        token_gnn_layers: int = 4,
         token_gnn_graph: str = 'full',
         token_gnn_layer_scale: float = 0.1,
     ) -> None:

@@ -17,7 +17,7 @@ The goal is to let non-sequential tokens exchange field-level information before
 | Base model | `PCVRHyFormer` |
 | New module | `TokenGNN` |
 | GNN position | after `ns_tokens` construction |
-| GNN layers | 2 |
+| GNN layers | 4 |
 | Graph type | fully connected graph over NS tokens |
 | Default run script | enabled in `run.sh` |
 | Stability setting | residual layer scale initialized to `0.1` |
@@ -55,7 +55,7 @@ For each token:
 5. add a small scaled residual update.
 
 This keeps the module cheap and stable. The residual scale starts at `0.1`, so
-the two GNN layers begin close to the baseline representation instead of
+the four GNN layers begin close to the baseline representation instead of
 rewriting the NS tokens aggressively.
 
 ## Expected Result
@@ -78,7 +78,7 @@ Equivalent explicit flags:
 
 ```bash
 --use_token_gnn \
---token_gnn_layers 2 \
+--token_gnn_layers 4 \
 --token_gnn_graph full \
 --token_gnn_layer_scale 0.1
 ```
@@ -89,7 +89,7 @@ Use `train.py` directly without `--use_token_gnn`, or remove these flags from `r
 
 ```bash
 --use_token_gnn
---token_gnn_layers 2
+--token_gnn_layers 4
 --token_gnn_graph full
 --token_gnn_layer_scale 0.1
 ```
@@ -101,7 +101,7 @@ Run two experiments with the same data split and seed:
 | Experiment | Flags |
 | --- | --- |
 | Baseline | no `--use_token_gnn` |
-| GNN-NS | `--use_token_gnn --token_gnn_layers 2 --token_gnn_graph full --token_gnn_layer_scale 0.1` |
+| GNN-NS | `--use_token_gnn --token_gnn_layers 4 --token_gnn_graph full --token_gnn_layer_scale 0.1` |
 
 Compare:
 
@@ -125,7 +125,7 @@ Your current smoke-test baseline report is:
 | Validation AUC | 0.7083 |
 | Validation LogLoss | 0.3160 |
 
-For the 2-layer GNN-NS run, inspect these differences:
+For the 4-layer GNN-NS run, inspect these differences:
 
 | Result field | Expected GNN-NS behavior |
 | --- | --- |
@@ -134,8 +134,8 @@ For the 2-layer GNN-NS run, inspect these differences:
 | Average train loss | Should be close to baseline; a large jump suggests the GNN update is too strong. |
 | Validation AUC | May be slightly higher, similar, or noisy on 500 validation rows. Treat changes below about 0.01 cautiously. |
 | Validation LogLoss | Should stay close to `0.3160`; a lower value is a good sign even if AUC is noisy. |
-| Total parameters | Should increase slightly because TokenGNN adds several small linear layers. |
-| Step time / epoch time | Should be slightly slower because NS tokens now run through two message-passing layers. |
+| Total parameters | Should increase more than the 2-layer version because TokenGNN now has four small message-passing layers. |
+| Step time / epoch time | Should be slower than the 2-layer version because NS tokens now run through four message-passing layers. |
 | Checkpoint path | Should still save a `.best_model/model.pt` checkpoint. |
 | Training stability | No NaN warnings, no exploding loss, and normal early-stopping/checkpoint logs. |
 

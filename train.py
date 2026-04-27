@@ -196,9 +196,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_token_gnn', action='store_true', default=False,
                         help='Enable GNN-NS: a lightweight TokenGNN over '
                              'non-sequential tokens after NS tokenization')
-    parser.add_argument('--token_gnn_layers', type=int, default=2,
+    parser.add_argument('--token_gnn_layers', type=int, default=4,
                         help='Number of TokenGNN layers over NS tokens '
-                             '(recommended: 2 for the stable GNN-NS variant)')
+                             '(recommended: 4 for the current GNN-NS variant)')
     parser.add_argument('--token_gnn_graph', type=str, default='full',
                         choices=['full'],
                         help='Graph structure for TokenGNN; full = complete '

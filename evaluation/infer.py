@@ -72,7 +72,7 @@ _FALLBACK_MODEL_CFG = {
     # the keys; normal evaluation should read the exact values saved during
     # training.
     'use_token_gnn': False,
-    'token_gnn_layers': 2,
+    'token_gnn_layers': 4,
     'token_gnn_graph': 'full',
     'token_gnn_layer_scale': 0.1,
 }
