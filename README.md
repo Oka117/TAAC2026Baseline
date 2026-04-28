@@ -7,8 +7,6 @@
 
 ## Quickstart (Local)
 
-This repository contains a self-contained baseline implementation.
-
 1) Install dependencies
 
 ```bash
@@ -17,11 +15,8 @@ pip install -r requirements.txt
 
 2) Prepare data
 
-The official training environment provides the dataset directory and output
-paths via environment variables.
-
-For local runs, you must point `--data_dir` (or `TRAIN_DATA_PATH`) to a
-directory that contains **parquet shards** and a **schema.json**.
+For local runs, point `--data_dir` (or `TRAIN_DATA_PATH`) to a directory that
+contains parquet shards and a `schema.json`.
 
 3) Run training
 
@@ -29,8 +24,20 @@ directory that contains **parquet shards** and a **schema.json**.
 bash run.sh --data_dir /path/to/official_dataset_dir
 ```
 
-> Note: `demo_1000.parquet` is for quick inspection only; it is not guaranteed
-> to include the full training directory layout (e.g., `schema.json`).
+### Smoke test with the official 1k-row sample (HuggingFace)
+
+If you just want to sanity-check the training loop locally, run the smoke test
+on the official sample dataset `TAAC2026/data_sample_1000`:
+
+```bash
+bash smoke_test_hf_sample.sh
+```
+
+This downloads `demo_1000.parquet` and generates a *debug-only* `schema.json`
+derived from the 1k-row sample.
+
+> The generated `schema.json` does NOT reflect the official vocab sizes and is
+> only intended for local smoke tests.
 
 ## Introduction
 
