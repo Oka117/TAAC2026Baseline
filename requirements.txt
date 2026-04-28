@@ -1,0 +1,9 @@
+# Minimal runtime requirements for the TAAC2026Baseline.
+# Versions are intentionally loose to better match diverse environments.
+
+numpy
+pyarrow
+pandas
+scikit-learn
+torch
+tqdm
