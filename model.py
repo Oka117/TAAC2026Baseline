@@ -18,6 +18,15 @@ class ModelInput(NamedTuple):
     seq_time_buckets: dict  # {domain: tensor [B, L]}
 
 
+def _parse_fid_list(value: Union[str, List[int], Tuple[int, ...]]) -> List[int]:
+    """Parse a comma-separated fid list while keeping list inputs unchanged."""
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        return [int(x.strip()) for x in value.split(',') if x.strip()]
+    return [int(x) for x in value]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rotary Position Embedding (RoPE)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1273,6 +1282,288 @@ class TokenGNN(nn.Module):
         return tokens
 
 
+class SequenceGraphLayer(nn.Module):
+    """Temporal message-passing layer over one behavior sequence.
+
+    Each event token receives messages from its adjacent valid events and from
+    the target item context. The layer is deliberately local and residual so it
+    can be inserted before the existing Transformer/HyFormer blocks without
+    changing sequence lengths or masks.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        dropout: float = 0.0,
+        layer_scale_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.token_norm = nn.LayerNorm(d_model)
+        self.target_norm = nn.LayerNorm(d_model)
+        self.self_proj = nn.Linear(d_model, d_model)
+        self.neigh_proj = nn.Linear(d_model, d_model)
+        self.target_proj = nn.Linear(d_model, d_model)
+        self.target_gate = nn.Linear(d_model * 2, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_scale = nn.Parameter(torch.full((d_model,), layer_scale_init))
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        target_context: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Update event tokens using adjacent-event and target-item messages.
+
+        Args:
+            tokens: Sequence tokens of shape (B, L, D).
+            padding_mask: Boolean mask of shape (B, L), True means padding.
+            target_context: Optional target item context of shape (B, D).
+
+        Returns:
+            Updated sequence tokens with the same shape as ``tokens``.
+        """
+        B, L, _ = tokens.shape
+        x = self.token_norm(tokens)
+
+        if padding_mask is None:
+            valid = tokens.new_ones(B, L, 1)
+        else:
+            valid = (~padding_mask).unsqueeze(-1).float()
+        x_valid = x * valid
+
+        # Local temporal graph: previous <-> current <-> next, masking padded
+        # neighbors so short histories do not leak zeros into real positions.
+        prev = F.pad(x_valid[:, :-1, :], (0, 0, 1, 0))
+        next_ = F.pad(x_valid[:, 1:, :], (0, 0, 0, 1))
+        prev_valid = F.pad(valid[:, :-1, :], (0, 0, 1, 0))
+        next_valid = F.pad(valid[:, 1:, :], (0, 0, 0, 1))
+        neigh = (prev + next_) / (prev_valid + next_valid).clamp_min(1.0)
+
+        msg = self.self_proj(x) + self.neigh_proj(neigh)
+
+        if target_context is not None:
+            target = self.target_norm(target_context).unsqueeze(1).expand(-1, L, -1)
+            gate = torch.sigmoid(self.target_gate(torch.cat([x, target], dim=-1)))
+            msg = msg + gate * self.target_proj(target)
+
+        delta = self.out_proj(F.silu(msg)) * valid
+        scale = self.layer_scale.view(1, 1, -1)
+        return tokens + self.dropout(delta) * scale
+
+
+class SequenceGraphEncoder(nn.Module):
+    """Stacked temporal GNN plus a compact graph-memory summary token."""
+
+    def __init__(
+        self,
+        d_model: int,
+        num_layers: int = 2,
+        dropout: float = 0.0,
+        layer_scale_init: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            SequenceGraphLayer(
+                d_model=d_model,
+                dropout=dropout,
+                layer_scale_init=layer_scale_init,
+            )
+            for _ in range(max(0, num_layers))
+        ])
+        self.summary_proj = nn.Sequential(
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        target_context: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        for layer in self.layers:
+            tokens = layer(tokens, padding_mask, target_context)
+
+        B, L, D = tokens.shape
+        if padding_mask is None:
+            valid = tokens.new_ones(B, L, 1)
+            valid_count = valid.sum(dim=1)
+        else:
+            valid = (~padding_mask).unsqueeze(-1).float()
+            valid_count = valid.sum(dim=1)
+
+        mean_pool = (tokens * valid).sum(dim=1) / valid_count.clamp_min(1.0)
+        raw_len = valid_count.squeeze(-1).long()
+        last_idx = raw_len.clamp(min=1) - 1
+        gather_idx = last_idx.view(B, 1, 1).expand(-1, 1, D)
+        last_token = torch.gather(tokens, dim=1, index=gather_idx).squeeze(1)
+
+        summary = self.summary_proj(torch.cat([mean_pool, last_token], dim=-1))
+        empty = raw_len == 0
+        if empty.any():
+            summary = summary.masked_fill(empty.unsqueeze(-1), 0.0)
+        return tokens, summary
+
+
+class AlignedDenseIntGraphEncoder(nn.Module):
+    """Element-level graph encoder for aligned user int/dense list features.
+
+    Several official fields have the form ``user_int_feats_fid[i]`` aligned
+    with ``user_dense_feats_fid[i]``. Mean-pooling the int list and projecting
+    all dense values separately loses this binding. This encoder rebuilds those
+    pairs as element nodes, pools them into per-field graph tokens, then lets
+    the field tokens exchange messages through a tiny complete-graph GNN.
+    """
+
+    def __init__(
+        self,
+        aligned_specs: List[Tuple[int, int, int, int, int, int]],
+        emb_dim: int,
+        d_model: int,
+        num_layers: int = 1,
+        num_output_tokens: int = 8,
+        top_k: int = 64,
+        dropout: float = 0.0,
+        emb_skip_threshold: int = 0,
+    ) -> None:
+        super().__init__()
+        self.aligned_specs = aligned_specs
+        self.emb_dim = emb_dim
+        self.d_model = d_model
+        self.num_fields = len(aligned_specs)
+        self.num_output_tokens = max(1, int(num_output_tokens))
+        self.top_k = max(1, int(top_k))
+
+        embs = []
+        for _, vocab_size, _, _, _, _ in aligned_specs:
+            skip = (
+                int(vocab_size) <= 0
+                or (emb_skip_threshold > 0 and int(vocab_size) > emb_skip_threshold)
+            )
+            if skip:
+                embs.append(None)
+            else:
+                embs.append(nn.Embedding(int(vocab_size) + 1, emb_dim, padding_idx=0))
+        self.embs = nn.ModuleList([e for e in embs if e is not None])
+        self._emb_index = []
+        real_idx = 0
+        for e in embs:
+            if e is None:
+                self._emb_index.append(-1)
+            else:
+                self._emb_index.append(real_idx)
+                real_idx += 1
+
+        self.id_proj = nn.Linear(emb_dim, d_model)
+        self.value_proj = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.field_embedding = nn.Embedding(max(1, self.num_fields), d_model)
+        self.position_embedding = nn.Embedding(self.top_k, d_model)
+        self.element_norm = nn.LayerNorm(d_model)
+        self.pool_score = nn.Linear(d_model, 1)
+        self.field_norm = nn.LayerNorm(d_model)
+        self.graph_layers = nn.ModuleList([
+            TokenGNNLayer(
+                d_model=d_model,
+                dropout=dropout,
+                layer_scale_init=0.05,
+            )
+            for _ in range(max(0, num_layers))
+        ])
+        self.output_queries = nn.Parameter(
+            torch.randn(self.num_output_tokens, d_model) * 0.02)
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def reset_parameters(self) -> None:
+        for emb in self.embs:
+            nn.init.xavier_normal_(emb.weight.data)
+            emb.weight.data[0, :] = 0
+
+    @staticmethod
+    def _stable_dense_value(values: torch.Tensor) -> torch.Tensor:
+        values = torch.nan_to_num(values.float(), nan=0.0, posinf=1e6, neginf=-1e6)
+        values = values.clamp(min=-1e6, max=1e6)
+        return torch.sign(values) * torch.log1p(values.abs())
+
+    def forward(
+        self,
+        user_int_feats: torch.Tensor,
+        user_dense_feats: torch.Tensor,
+    ) -> torch.Tensor:
+        B = user_int_feats.shape[0]
+        if self.num_fields == 0:
+            return user_int_feats.new_zeros(
+                B, self.num_output_tokens, self.d_model, dtype=torch.float)
+
+        field_tokens = []
+        for field_idx, (_, _, int_offset, int_len, dense_offset, dense_len) in enumerate(
+            self.aligned_specs
+        ):
+            use_len = min(int_len, dense_len, self.top_k)
+            if use_len <= 0:
+                field_tokens.append(
+                    user_int_feats.new_zeros(B, self.d_model, dtype=torch.float))
+                continue
+
+            ids = user_int_feats[:, int_offset:int_offset + use_len].long()
+            dense = user_dense_feats[:, dense_offset:dense_offset + use_len]
+            mask = ids.ne(0)
+
+            emb_real_idx = self._emb_index[field_idx]
+            if emb_real_idx == -1:
+                id_emb = user_int_feats.new_zeros(
+                    B, use_len, self.emb_dim, dtype=torch.float)
+            else:
+                id_emb = self.embs[emb_real_idx](ids)
+
+            dense_value = self._stable_dense_value(dense).unsqueeze(-1)
+            pos = torch.arange(use_len, device=user_int_feats.device)
+            elem = (
+                self.id_proj(id_emb)
+                + self.value_proj(dense_value)
+                + self.field_embedding.weight[field_idx].view(1, 1, -1)
+                + self.position_embedding(pos).unsqueeze(0)
+            )
+            elem = self.element_norm(elem)
+            elem = elem * mask.unsqueeze(-1).float()
+
+            scores = self.pool_score(elem).squeeze(-1).masked_fill(~mask, -1e4)
+            weights = torch.softmax(scores, dim=-1).unsqueeze(-1)
+            pooled = (elem * weights).sum(dim=1)
+            empty = ~mask.any(dim=1)
+            if empty.any():
+                pooled = pooled.masked_fill(empty.unsqueeze(-1), 0.0)
+            field_tokens.append(pooled)
+
+        tokens = torch.stack(field_tokens, dim=1)
+        tokens = self.dropout(self.field_norm(tokens))
+        for layer in self.graph_layers:
+            tokens = layer(tokens)
+
+        queries = self.output_norm(self.output_queries)
+        keys = self.output_norm(tokens)
+        attn_scores = torch.einsum('td,bfd->btf', queries, keys) / math.sqrt(self.d_model)
+        attn = torch.softmax(attn_scores, dim=-1)
+        out = torch.einsum('btf,bfd->btd', attn, tokens)
+        return self.output_proj(out)
+
+
 class PCVRHyFormer(nn.Module):
     """PCVRHyFormer model for post-click conversion rate prediction.
 
@@ -1291,6 +1582,8 @@ class PCVRHyFormer(nn.Module):
         # NS grouping config (grouped by fid index)
         user_ns_groups: List[List[int]],
         item_ns_groups: List[List[int]],
+        user_int_feature_ids: Optional[List[int]] = None,
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         # Model hyperparameters
         d_model: int = 64,
         emb_dim: int = 64,
@@ -1318,6 +1611,19 @@ class PCVRHyFormer(nn.Module):
         token_gnn_layers: int = 4,
         token_gnn_graph: str = 'full',
         token_gnn_layer_scale: float = 0.1,
+        # Optional temporal GNN over behavior sequence tokens
+        use_seq_graph: bool = False,
+        seq_graph_layers: int = 2,
+        seq_graph_layer_scale: float = 0.1,
+        seq_graph_use_target: bool = True,
+        graph_output_fusion: bool = True,
+        # Optional graph over aligned user_int/user_dense list pairs
+        use_aligned_dense_int_graph: bool = False,
+        aligned_graph_fids: Union[str, List[int]] = '62,63,64,65,66,89,90,91',
+        aligned_graph_layers: int = 1,
+        aligned_graph_tokens: int = 8,
+        aligned_graph_top_k: int = 64,
+        output_include_ns: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1334,6 +1640,11 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_token_gnn = use_token_gnn
+        self.use_seq_graph = use_seq_graph
+        self.seq_graph_enabled = use_seq_graph and seq_graph_layers > 0
+        self.seq_graph_use_target = seq_graph_use_target
+        self.graph_output_fusion = graph_output_fusion
+        self.output_include_ns = output_include_ns
 
         # ================== NS Tokens Construction ==================
 
@@ -1402,6 +1713,11 @@ class PCVRHyFormer(nn.Module):
             )
 
         # Total NS token count
+        self.num_user_ns = num_user_ns
+        self.num_item_ns = num_item_ns
+        self.item_ns_start = num_user_ns + (1 if self.has_user_dense else 0)
+        self.item_ns_end = self.item_ns_start + num_item_ns + (
+            1 if self.has_item_dense else 0)
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
@@ -1482,6 +1798,78 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # ================== Sequence Graph Encoder ==================
+        # GNN+Transformer path: first run local temporal graph propagation on
+        # every behavior domain, then let the existing Transformer/HyFormer
+        # stack consume the graph-enhanced sequence tokens.
+        if self.seq_graph_enabled:
+            self.seq_graph_encoders = nn.ModuleDict({
+                domain: SequenceGraphEncoder(
+                    d_model=d_model,
+                    num_layers=seq_graph_layers,
+                    dropout=dropout_rate,
+                    layer_scale_init=seq_graph_layer_scale,
+                )
+                for domain in self.seq_domains
+            })
+        else:
+            self.seq_graph_encoders = nn.ModuleDict()
+
+        # ================== Aligned Dense-Int Graph Encoder ==================
+        # Rebuild element-wise pairs such as user_int_feats_62[i] aligned with
+        # user_dense_feats_62[i]. This preserves a strong signal that the
+        # baseline loses when it pools int ids and dense values separately.
+        aligned_fids = _parse_fid_list(aligned_graph_fids)
+        user_int_feature_ids = user_int_feature_ids or []
+        user_dense_feature_specs = user_dense_feature_specs or []
+        int_by_fid = {}
+        for fid, spec in zip(user_int_feature_ids, user_int_feature_specs):
+            int_by_fid[int(fid)] = spec
+        dense_by_fid = {
+            int(fid): (int(offset), int(length))
+            for fid, offset, length in user_dense_feature_specs
+        }
+        aligned_specs = []
+        for fid in aligned_fids:
+            if fid not in int_by_fid or fid not in dense_by_fid:
+                continue
+            vocab_size, int_offset, int_len = int_by_fid[fid]
+            dense_offset, dense_len = dense_by_fid[fid]
+            if int_len <= 0 or dense_len <= 0:
+                continue
+            aligned_specs.append((
+                fid,
+                int(vocab_size),
+                int(int_offset),
+                int(int_len),
+                int(dense_offset),
+                int(dense_len),
+            ))
+
+        self.aligned_graph_enabled = (
+            use_aligned_dense_int_graph
+            and len(aligned_specs) > 0
+            and aligned_graph_tokens > 0
+        )
+        self.aligned_graph_tokens = int(aligned_graph_tokens)
+        if self.aligned_graph_enabled:
+            self.aligned_graph_encoder = AlignedDenseIntGraphEncoder(
+                aligned_specs=aligned_specs,
+                emb_dim=emb_dim,
+                d_model=d_model,
+                num_layers=aligned_graph_layers,
+                num_output_tokens=aligned_graph_tokens,
+                top_k=aligned_graph_top_k,
+                dropout=dropout_rate,
+                emb_skip_threshold=emb_skip_threshold,
+            )
+        else:
+            self.aligned_graph_encoder = None
+            if use_aligned_dense_int_graph:
+                logging.warning(
+                    "use_aligned_dense_int_graph=True but no aligned fid specs "
+                    "were found; aligned graph is disabled.")
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1517,9 +1905,19 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
-        # Output projection
+        # Output projection. When graph_output_fusion is enabled, append one
+        # compact graph-memory summary per sequence domain to the prediction
+        # representation. This changes only the head input size, not the
+        # HyFormer token count or RankMixer divisibility constraint.
+        output_token_count = num_queries * self.num_sequences
+        if self.output_include_ns:
+            output_token_count += self.num_ns
+        if self.seq_graph_enabled and self.graph_output_fusion:
+            output_token_count += self.num_sequences
+        if self.aligned_graph_enabled:
+            output_token_count += self.aligned_graph_tokens
         self.output_proj = nn.Sequential(
-            nn.Linear(num_queries * self.num_sequences * d_model, d_model),
+            nn.Linear(output_token_count * d_model, d_model),
             nn.LayerNorm(d_model),
         )
 
@@ -1572,6 +1970,9 @@ class PCVRHyFormer(nn.Module):
             nn.init.xavier_normal_(self.time_embedding.weight.data)
             self.time_embedding.weight.data[0, :] = 0
 
+        if self.aligned_graph_encoder is not None:
+            self.aligned_graph_encoder.reset_parameters()
+
     def reinit_high_cardinality_params(
         self, cardinality_threshold: int = 10000
     ) -> "set[int]":
@@ -1617,6 +2018,22 @@ class PCVRHyFormer(nn.Module):
                 if real_idx == -1:
                     continue
                 emb = tokenizer.embs[real_idx]
+                if int(vs) > cardinality_threshold:
+                    nn.init.xavier_normal_(emb.weight.data)
+                    emb.weight.data[0, :] = 0
+                    reinit_ptrs.add(emb.weight.data_ptr())
+                    reinit_count += 1
+                else:
+                    skip_count += 1
+
+        if self.aligned_graph_encoder is not None:
+            for i, (_, vs, _, _, _, _) in enumerate(
+                self.aligned_graph_encoder.aligned_specs
+            ):
+                real_idx = self.aligned_graph_encoder._emb_index[i]
+                if real_idx == -1:
+                    continue
+                emb = self.aligned_graph_encoder.embs[real_idx]
                 if int(vs) > cardinality_threshold:
                     nn.init.xavier_normal_(emb.weight.data)
                     emb.weight.data[0, :] = 0
@@ -1708,12 +2125,71 @@ class PCVRHyFormer(nn.Module):
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
         return self.token_gnn(ns_tokens)
 
+    def _target_context_from_ns(self, ns_tokens: torch.Tensor) -> torch.Tensor:
+        """Pool target item tokens from the NS-token layout."""
+        item_tokens = ns_tokens[:, self.item_ns_start:self.item_ns_end, :]
+        if item_tokens.shape[1] == 0:
+            return ns_tokens.mean(dim=1)
+        return item_tokens.mean(dim=1)
+
+    def _build_sequence_tokens_and_masks(
+        self,
+        inputs: ModelInput,
+        ns_tokens: torch.Tensor,
+    ) -> Tuple[list, list, Optional[list]]:
+        """Embed all sequence domains and optionally apply SequenceGraphEncoder."""
+        seq_tokens_list = []
+        seq_masks_list = []
+        for domain in self.seq_domains:
+            tokens = self._embed_seq_domain(
+                inputs.seq_data[domain],
+                self._seq_embs[domain], self._seq_proj[domain],
+                self._seq_is_id[domain], self._seq_emb_index[domain],
+                inputs.seq_time_buckets[domain])
+            seq_tokens_list.append(tokens)
+            mask = self._make_padding_mask(
+                inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
+            seq_masks_list.append(mask)
+
+        graph_summaries = None
+        if self.seq_graph_enabled and len(self.seq_graph_encoders) > 0:
+            target_context = (
+                self._target_context_from_ns(ns_tokens)
+                if self.seq_graph_use_target else None
+            )
+            graph_summaries = []
+            enhanced_seq_tokens = []
+            for domain, tokens, mask in zip(
+                self.seq_domains, seq_tokens_list, seq_masks_list
+            ):
+                tokens, summary = self.seq_graph_encoders[domain](
+                    tokens, mask, target_context)
+                enhanced_seq_tokens.append(tokens)
+                graph_summaries.append(summary)
+            seq_tokens_list = enhanced_seq_tokens
+
+        return seq_tokens_list, seq_masks_list, graph_summaries
+
+    def _build_aligned_graph_tokens(
+        self,
+        inputs: ModelInput,
+    ) -> Optional[torch.Tensor]:
+        """Build graph-memory tokens for aligned user int/dense list pairs."""
+        if not self.aligned_graph_enabled or self.aligned_graph_encoder is None:
+            return None
+        return self.aligned_graph_encoder(
+            inputs.user_int_feats,
+            inputs.user_dense_feats,
+        )
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
+        graph_summaries: Optional[list] = None,
+        aligned_graph_tokens: Optional[torch.Tensor] = None,
         apply_dropout: bool = True
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
@@ -1721,6 +2197,8 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list = [self.emb_dropout(q) for q in q_tokens_list]
             ns_tokens = self.emb_dropout(ns_tokens)
             seq_tokens_list = [self.emb_dropout(s) for s in seq_tokens_list]
+            if aligned_graph_tokens is not None:
+                aligned_graph_tokens = self.emb_dropout(aligned_graph_tokens)
 
         curr_qs = q_tokens_list
         curr_ns = ns_tokens
@@ -1750,10 +2228,19 @@ class PCVRHyFormer(nn.Module):
                 rope_sin_list=rope_sin_list,
             )
 
-        # Output: concatenate all sequences' Q tokens then project via MLP
+        # Output: concatenate all sequences' Q tokens and optional graph-memory
+        # summaries, then project via MLP.
         B = curr_qs[0].shape[0]
         all_q = torch.cat(curr_qs, dim=1)  # (B, Nq*S, D)
-        output = all_q.view(B, -1)  # (B, Nq*S*D)
+        output_tokens = all_q
+        if self.output_include_ns:
+            output_tokens = torch.cat([output_tokens, curr_ns], dim=1)
+        if self.seq_graph_enabled and self.graph_output_fusion and graph_summaries is not None:
+            graph_tokens = torch.stack(graph_summaries, dim=1)  # (B, S, D)
+            output_tokens = torch.cat([output_tokens, graph_tokens], dim=1)
+        if self.aligned_graph_enabled and aligned_graph_tokens is not None:
+            output_tokens = torch.cat([output_tokens, aligned_graph_tokens], dim=1)
+        output = output_tokens.reshape(B, -1)
         output = self.output_proj(output)  # (B, D)
 
         return output
@@ -1763,18 +2250,11 @@ class PCVRHyFormer(nn.Module):
         # 1. NS tokens: tokenizer output followed by optional GNN-NS.
         ns_tokens = self._build_ns_tokens(inputs)
 
-        # 2. Embed each sequence domain (dynamic)
-        seq_tokens_list = []
-        seq_masks_list = []
-        for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
-                inputs.seq_data[domain],
-                self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
-            seq_tokens_list.append(tokens)
-            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
-            seq_masks_list.append(mask)
+        # 2. Embed each sequence domain, then run optional temporal GNN.
+        seq_tokens_list, seq_masks_list, graph_summaries = (
+            self._build_sequence_tokens_and_masks(inputs, ns_tokens)
+        )
+        aligned_graph_tokens = self._build_aligned_graph_tokens(inputs)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
@@ -1782,6 +2262,8 @@ class PCVRHyFormer(nn.Module):
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            graph_summaries=graph_summaries,
+            aligned_graph_tokens=aligned_graph_tokens,
             apply_dropout=self.training
         )
 
@@ -1794,22 +2276,17 @@ class PCVRHyFormer(nn.Module):
         # Reuses forward logic with deterministic dropout behavior from eval().
         ns_tokens = self._build_ns_tokens(inputs)
 
-        seq_tokens_list = []
-        seq_masks_list = []
-        for domain in self.seq_domains:
-            tokens = self._embed_seq_domain(
-                inputs.seq_data[domain],
-                self._seq_embs[domain], self._seq_proj[domain],
-                self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
-            seq_tokens_list.append(tokens)
-            mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
-            seq_masks_list.append(mask)
+        seq_tokens_list, seq_masks_list, graph_summaries = (
+            self._build_sequence_tokens_and_masks(inputs, ns_tokens)
+        )
+        aligned_graph_tokens = self._build_aligned_graph_tokens(inputs)
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
+            graph_summaries=graph_summaries,
+            aligned_graph_tokens=aligned_graph_tokens,
             apply_dropout=False
         )
 

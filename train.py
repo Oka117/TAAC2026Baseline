@@ -206,6 +206,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--token_gnn_layer_scale', type=float, default=0.1,
                         help='Initial residual scale for each TokenGNN layer; '
                              'smaller values keep the model closer to baseline')
+    parser.add_argument('--use_seq_graph', action='store_true', default=False,
+                        help='Enable temporal SequenceGraphEncoder over each '
+                             'behavior sequence before the Transformer/HyFormer stack')
+    parser.add_argument('--seq_graph_layers', type=int, default=2,
+                        help='Number of temporal GNN layers per sequence domain')
+    parser.add_argument('--seq_graph_layer_scale', type=float, default=0.1,
+                        help='Initial residual scale for each temporal sequence-GNN layer')
+    parser.add_argument('--seq_graph_use_target', action='store_true', default=True,
+                        help='Use target item NS context in sequence graph message passing')
+    parser.add_argument('--no_seq_graph_target', dest='seq_graph_use_target',
+                        action='store_false',
+                        help='Disable target-item context inside SequenceGraphEncoder')
+    parser.add_argument('--graph_output_fusion', action='store_true', default=True,
+                        help='Fuse one graph-memory summary per sequence domain into the final head')
+    parser.add_argument('--no_graph_output_fusion', dest='graph_output_fusion',
+                        action='store_false',
+                        help='Disable graph-memory summaries in the final prediction head')
+    parser.add_argument('--output_include_ns', action='store_true', default=False,
+                        help='Concatenate final NS tokens into the prediction head')
+    parser.add_argument('--no_output_include_ns', dest='output_include_ns',
+                        action='store_false',
+                        help='Do not concatenate final NS tokens into the prediction head')
+    parser.add_argument('--use_aligned_dense_int_graph', action='store_true', default=False,
+                        help='Enable element-level graph encoding for aligned '
+                             'user_int/user_dense list feature pairs')
+    parser.add_argument('--aligned_graph_fids', type=str,
+                        default='62,63,64,65,66,89,90,91',
+                        help='Comma-separated fids whose user_int_feats and '
+                             'user_dense_feats are element-wise aligned')
+    parser.add_argument('--aligned_graph_layers', type=int, default=1,
+                        help='Number of TokenGNN layers over aligned field tokens')
+    parser.add_argument('--aligned_graph_tokens', type=int, default=8,
+                        help='Number of aligned graph-memory tokens fused into the final head')
+    parser.add_argument('--aligned_graph_top_k', type=int, default=64,
+                        help='Maximum elements per aligned fid used by the graph encoder')
 
     args = parser.parse_args()
 
@@ -294,6 +329,8 @@ def main() -> None:
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,
+        "user_int_feature_ids": pcvr_dataset.user_int_schema.feature_ids,
+        "user_dense_feature_specs": pcvr_dataset.user_dense_schema.entries,
         "d_model": args.d_model,
         "emb_dim": args.emb_dim,
         "num_queries": args.num_queries,
@@ -318,6 +355,17 @@ def main() -> None:
         "token_gnn_layers": args.token_gnn_layers,
         "token_gnn_graph": args.token_gnn_graph,
         "token_gnn_layer_scale": args.token_gnn_layer_scale,
+        "use_seq_graph": args.use_seq_graph,
+        "seq_graph_layers": args.seq_graph_layers,
+        "seq_graph_layer_scale": args.seq_graph_layer_scale,
+        "seq_graph_use_target": args.seq_graph_use_target,
+        "graph_output_fusion": args.graph_output_fusion,
+        "output_include_ns": args.output_include_ns,
+        "use_aligned_dense_int_graph": args.use_aligned_dense_int_graph,
+        "aligned_graph_fids": args.aligned_graph_fids,
+        "aligned_graph_layers": args.aligned_graph_layers,
+        "aligned_graph_tokens": args.aligned_graph_tokens,
+        "aligned_graph_top_k": args.aligned_graph_top_k,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -332,7 +380,14 @@ def main() -> None:
         f"use_token_gnn={args.use_token_gnn}, "
         f"token_gnn_layers={args.token_gnn_layers}, "
         f"token_gnn_graph={args.token_gnn_graph}, "
-        f"token_gnn_layer_scale={args.token_gnn_layer_scale}")
+        f"token_gnn_layer_scale={args.token_gnn_layer_scale}, "
+        f"use_seq_graph={args.use_seq_graph}, "
+        f"seq_graph_layers={args.seq_graph_layers}, "
+        f"graph_output_fusion={args.graph_output_fusion}, "
+        f"output_include_ns={args.output_include_ns}, "
+        f"use_aligned_dense_int_graph={args.use_aligned_dense_int_graph}, "
+        f"aligned_graph_fids={args.aligned_graph_fids}, "
+        f"aligned_graph_tokens={args.aligned_graph_tokens}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

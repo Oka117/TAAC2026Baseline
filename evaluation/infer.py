@@ -75,6 +75,17 @@ _FALLBACK_MODEL_CFG = {
     'token_gnn_layers': 4,
     'token_gnn_graph': 'full',
     'token_gnn_layer_scale': 0.1,
+    'use_seq_graph': False,
+    'seq_graph_layers': 2,
+    'seq_graph_layer_scale': 0.1,
+    'seq_graph_use_target': True,
+    'graph_output_fusion': True,
+    'output_include_ns': False,
+    'use_aligned_dense_int_graph': False,
+    'aligned_graph_fids': '62,63,64,65,66,89,90,91',
+    'aligned_graph_layers': 1,
+    'aligned_graph_tokens': 8,
+    'aligned_graph_top_k': 64,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'
@@ -236,6 +247,8 @@ def build_model(
         seq_vocab_sizes=dataset.seq_domain_vocab_sizes,
         user_ns_groups=user_ns_groups,
         item_ns_groups=item_ns_groups,
+        user_int_feature_ids=dataset.user_int_schema.feature_ids,
+        user_dense_feature_specs=dataset.user_dense_schema.entries,
         **model_cfg,
     ).to(device)
 
