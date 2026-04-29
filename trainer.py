@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -58,6 +59,11 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        weight_averaging: str = 'none',
+        ema_decay: float = 0.995,
+        weight_avg_start_step: int = 0,
+        weight_avg_update_every: int = 1,
+        weight_avg_include_sparse: bool = False,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -107,10 +113,124 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        self.weight_averaging: str = weight_averaging
+        self.ema_decay: float = ema_decay
+        self.weight_avg_start_step: int = max(0, weight_avg_start_step)
+        self.weight_avg_update_every: int = max(1, weight_avg_update_every)
+        self.weight_avg_include_sparse: bool = weight_avg_include_sparse
+        self.weight_avg_state: Dict[str, torch.Tensor] = {}
+        self.weight_avg_param_names = self._select_weight_avg_param_names()
+        self.weight_avg_num_updates: int = 0
+
+        if weight_averaging not in ('none', 'ema', 'swa'):
+            raise ValueError(
+                f"weight_averaging must be one of none|ema|swa, got {weight_averaging}")
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(f"ema_decay must be in [0, 1), got {ema_decay}")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+        if self.weight_averaging != 'none':
+            avg_param_count = sum(
+                p.numel()
+                for n, p in self.model.named_parameters()
+                if n in self.weight_avg_param_names
+            )
+            logging.info(
+                f"Weight averaging enabled: mode={self.weight_averaging}, "
+                f"ema_decay={self.ema_decay}, start_step={self.weight_avg_start_step}, "
+                f"update_every={self.weight_avg_update_every}, "
+                f"include_sparse={self.weight_avg_include_sparse}, "
+                f"averaged_params={len(self.weight_avg_param_names)} tensors / "
+                f"{avg_param_count:,} parameters")
+
+    def _select_weight_avg_param_names(self) -> "set[str]":
+        """Select parameter names included in EMA/SWA.
+
+        Sparse embedding tables are excluded by default to keep memory overhead
+        small for recommendation workloads. Dense parameters include the GNN,
+        query generator, HyFormer blocks, projections, and classifier.
+        """
+        if self.weight_averaging == 'none':
+            return set()
+
+        sparse_ptrs = set()
+        if not self.weight_avg_include_sparse and hasattr(self.model, 'get_sparse_params'):
+            sparse_ptrs = {p.data_ptr() for p in self.model.get_sparse_params()}
+
+        names = set()
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if not self.weight_avg_include_sparse and param.data_ptr() in sparse_ptrs:
+                continue
+            names.add(name)
+        return names
+
+    def _maybe_update_weight_average(self, global_step: int) -> None:
+        """Update EMA/SWA shadows after an optimizer step."""
+        if self.weight_averaging == 'none':
+            return
+        if global_step < self.weight_avg_start_step:
+            return
+        if (global_step - self.weight_avg_start_step) % self.weight_avg_update_every != 0:
+            return
+
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name not in self.weight_avg_param_names:
+                    continue
+
+                value = param.detach()
+                if name not in self.weight_avg_state:
+                    self.weight_avg_state[name] = value.clone()
+                    continue
+
+                avg_value = self.weight_avg_state[name]
+                if self.weight_averaging == 'ema':
+                    avg_value.mul_(self.ema_decay).add_(value, alpha=1.0 - self.ema_decay)
+                else:
+                    # Streaming SWA mean: avg += (x - avg) / (n + 1).
+                    avg_value.add_(value - avg_value, alpha=1.0 / float(self.weight_avg_num_updates + 1))
+
+            self.weight_avg_num_updates += 1
+
+    def _clear_weight_average(self, reason: str) -> None:
+        if self.weight_avg_state:
+            logging.info(f"Clearing weight average state: {reason}")
+        self.weight_avg_state.clear()
+        self.weight_avg_num_updates = 0
+
+    def _has_weight_average(self) -> bool:
+        return self.weight_averaging != 'none' and self.weight_avg_num_updates > 0
+
+    @contextmanager
+    def _averaged_model_scope(self):
+        """Temporarily swap averaged weights into ``self.model``.
+
+        The optimizer always keeps training the live weights. Validation and
+        best-checkpoint saving use this scope so the reported metric and saved
+        model correspond to the flattened EMA/SWA solution.
+        """
+        if not self._has_weight_average():
+            yield self.model
+            return
+
+        param_map = dict(self.model.named_parameters())
+        backup = []
+        with torch.no_grad():
+            for name, avg_value in self.weight_avg_state.items():
+                param = param_map[name]
+                backup.append((param, param.detach().clone()))
+                param.copy_(avg_value.to(device=param.device, dtype=param.dtype))
+
+        try:
+            yield self.model
+        finally:
+            with torch.no_grad():
+                for param, original_value in backup:
+                    param.copy_(original_value)
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -189,7 +309,8 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            with self._averaged_model_scope() as checkpoint_model:
+                torch.save(checkpoint_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -252,10 +373,11 @@ class PCVRHyFormerRankingTrainer:
         if not is_likely_new_best:
             # No new best anticipated: leave disk untouched. The previous
             # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
-                "best_val_AUC": val_auc,
-                "best_val_logloss": val_logloss,
-            })
+            with self._averaged_model_scope() as checkpoint_model:
+                self.early_stopping(val_auc, checkpoint_model, {
+                    "best_val_AUC": val_auc,
+                    "best_val_logloss": val_logloss,
+                })
             return
 
         # Point EarlyStopping at the canonical best-model location for this
@@ -271,10 +393,11 @@ class PCVRHyFormerRankingTrainer:
         # I/O needed when a new best is confirmed.
         self._remove_old_best_dirs()
 
-        self.early_stopping(val_auc, self.model, {
-            "best_val_AUC": val_auc,
-            "best_val_logloss": val_logloss,
-        })
+        with self._averaged_model_scope() as checkpoint_model:
+            self.early_stopping(val_auc, checkpoint_model, {
+                "best_val_AUC": val_auc,
+                "best_val_logloss": val_logloss,
+            })
 
         # Write sidecar files only when EarlyStopping actually confirmed a
         # new best and wrote model.pt. If the score tripped our heuristic
@@ -303,6 +426,7 @@ class PCVRHyFormerRankingTrainer:
             for step, batch in train_pbar:
                 loss = self._train_step(batch)
                 total_step += 1
+                self._maybe_update_weight_average(total_step)
                 loss_sum += loss
 
                 if self.writer:
@@ -362,6 +486,9 @@ class PCVRHyFormerRankingTrainer:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
                 reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                if self.weight_avg_include_sparse and reinit_ptrs:
+                    self._clear_weight_average(
+                        "sparse embeddings were reinitialized and included in averaging")
                 sparse_params = self.model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
@@ -434,7 +561,6 @@ class PCVRHyFormerRankingTrainer:
         out before computing both metrics.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
-        self.model.eval()
         if not epoch:
             epoch = -1
 
@@ -443,11 +569,13 @@ class PCVRHyFormerRankingTrainer:
         all_logits_list = []
         all_labels_list = []
 
-        with torch.no_grad():
-            for step, batch in pbar:
-                logits, labels = self._evaluate_step(batch)
-                all_logits_list.append(logits.detach().cpu())
-                all_labels_list.append(labels.detach().cpu())
+        with self._averaged_model_scope() as eval_model:
+            eval_model.eval()
+            with torch.no_grad():
+                for step, batch in pbar:
+                    logits, labels = self._evaluate_step(batch, eval_model)
+                    all_logits_list.append(logits.detach().cpu())
+                    all_labels_list.append(labels.detach().cpu())
 
         all_logits = torch.cat(all_logits_list, dim=0)
         all_labels = torch.cat(all_labels_list, dim=0).long()
@@ -481,14 +609,17 @@ class PCVRHyFormerRankingTrainer:
         return auc, logloss
 
     def _evaluate_step(
-        self, batch: Dict[str, Any]
+        self,
+        batch: Dict[str, Any],
+        model: Optional[nn.Module] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Run a single validation step and return ``(logits, labels)``."""
         device_batch = self._batch_to_device(batch)
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        eval_model = model if model is not None else self.model
+        logits, _ = eval_model.predict(model_input)  # (B, 1), (B, D)
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label

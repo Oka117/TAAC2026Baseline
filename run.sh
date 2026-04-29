@@ -2,10 +2,11 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: RankMixer NS tokenizer + low-risk GNN-NS ----
+# ---- Active config: RankMixer NS tokenizer + low-risk GNN-NS + generalization ----
 # GNN-NS places a 4-layer fully-connected TokenGNN after NS token construction.
-# It should be a small, low-risk change: modestly slower training, with AUC
-# expected to improve slightly or stay close to the baseline.
+# Token augmentation and EMA are enabled as conservative generalization
+# regularizers: modestly slower training, with validation logloss expected to
+# become more stable and AUC expected to improve slightly or stay close.
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -15,6 +16,15 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --token_gnn_layers 4 \
     --token_gnn_graph full \
     --token_gnn_layer_scale 0.1 \
+    --use_generalization_aug \
+    --ns_token_dropout_rate 0.05 \
+    --ns_token_noise_std 0.01 \
+    --seq_token_dropout_rate 0.03 \
+    --seq_token_noise_std 0.005 \
+    --weight_averaging ema \
+    --ema_decay 0.995 \
+    --weight_avg_start_step 0 \
+    --weight_avg_update_every 1 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

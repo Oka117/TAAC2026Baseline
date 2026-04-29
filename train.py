@@ -207,6 +207,39 @@ def parse_args() -> argparse.Namespace:
                         help='Initial residual scale for each TokenGNN layer; '
                              'smaller values keep the model closer to baseline')
 
+    # Generalization augmentation over token representations.
+    parser.add_argument('--use_generalization_aug', action='store_true', default=False,
+                        help='Enable training-time token dropout/noise augmentation '
+                             'for NS and sequence token representations')
+    parser.add_argument('--ns_token_dropout_rate', type=float, default=0.0,
+                        help='Probability of dropping a whole non-sequential token '
+                             'during training when --use_generalization_aug is enabled')
+    parser.add_argument('--ns_token_noise_std', type=float, default=0.0,
+                        help='Gaussian noise std added to non-sequential tokens during '
+                             'training when --use_generalization_aug is enabled')
+    parser.add_argument('--seq_token_dropout_rate', type=float, default=0.0,
+                        help='Probability of dropping a whole sequence event token '
+                             'during training when --use_generalization_aug is enabled')
+    parser.add_argument('--seq_token_noise_std', type=float, default=0.0,
+                        help='Gaussian noise std added to sequence event tokens during '
+                             'training when --use_generalization_aug is enabled')
+
+    # Flat-minima training via weight averaging.
+    parser.add_argument('--weight_averaging', type=str, default='none',
+                        choices=['none', 'ema', 'swa'],
+                        help='Use averaged weights for validation/checkpointing: '
+                             'none = disabled, ema = exponential moving average, '
+                             'swa = stochastic weight averaging')
+    parser.add_argument('--ema_decay', type=float, default=0.995,
+                        help='EMA decay used when --weight_averaging=ema')
+    parser.add_argument('--weight_avg_start_step', type=int, default=0,
+                        help='Global step from which EMA/SWA updates start')
+    parser.add_argument('--weight_avg_update_every', type=int, default=1,
+                        help='Update EMA/SWA every N optimizer steps')
+    parser.add_argument('--weight_avg_include_sparse', action='store_true', default=False,
+                        help='Also average sparse embedding tables. Disabled by default '
+                             'to avoid duplicating large recommender embeddings.')
+
     args = parser.parse_args()
 
     # Environment variables take precedence.
@@ -318,6 +351,11 @@ def main() -> None:
         "token_gnn_layers": args.token_gnn_layers,
         "token_gnn_graph": args.token_gnn_graph,
         "token_gnn_layer_scale": args.token_gnn_layer_scale,
+        "use_generalization_aug": args.use_generalization_aug,
+        "ns_token_dropout_rate": args.ns_token_dropout_rate,
+        "ns_token_noise_std": args.ns_token_noise_std,
+        "seq_token_dropout_rate": args.seq_token_dropout_rate,
+        "seq_token_noise_std": args.seq_token_noise_std,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -332,7 +370,13 @@ def main() -> None:
         f"use_token_gnn={args.use_token_gnn}, "
         f"token_gnn_layers={args.token_gnn_layers}, "
         f"token_gnn_graph={args.token_gnn_graph}, "
-        f"token_gnn_layer_scale={args.token_gnn_layer_scale}")
+        f"token_gnn_layer_scale={args.token_gnn_layer_scale}, "
+        f"use_generalization_aug={args.use_generalization_aug}, "
+        f"ns_token_dropout_rate={args.ns_token_dropout_rate}, "
+        f"ns_token_noise_std={args.ns_token_noise_std}, "
+        f"seq_token_dropout_rate={args.seq_token_dropout_rate}, "
+        f"seq_token_noise_std={args.seq_token_noise_std}, "
+        f"weight_averaging={args.weight_averaging}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())
@@ -373,6 +417,11 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
+        weight_averaging=args.weight_averaging,
+        ema_decay=args.ema_decay,
+        weight_avg_start_step=args.weight_avg_start_step,
+        weight_avg_update_every=args.weight_avg_update_every,
+        weight_avg_include_sparse=args.weight_avg_include_sparse,
     )
 
     trainer.train()

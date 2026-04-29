@@ -75,6 +75,11 @@ _FALLBACK_MODEL_CFG = {
     'token_gnn_layers': 4,
     'token_gnn_graph': 'full',
     'token_gnn_layer_scale': 0.1,
+    'use_generalization_aug': False,
+    'ns_token_dropout_rate': 0.0,
+    'ns_token_noise_std': 0.0,
+    'seq_token_dropout_rate': 0.0,
+    'seq_token_noise_std': 0.0,
 }
 
 _FALLBACK_SEQ_MAX_LENS = 'seq_a:256,seq_b:256,seq_c:512,seq_d:512'

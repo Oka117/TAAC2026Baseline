@@ -1318,6 +1318,12 @@ class PCVRHyFormer(nn.Module):
         token_gnn_layers: int = 4,
         token_gnn_graph: str = 'full',
         token_gnn_layer_scale: float = 0.1,
+        # Training-time generalization augmentation over token representations
+        use_generalization_aug: bool = False,
+        ns_token_dropout_rate: float = 0.0,
+        ns_token_noise_std: float = 0.0,
+        seq_token_dropout_rate: float = 0.0,
+        seq_token_noise_std: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -1334,6 +1340,31 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.use_token_gnn = use_token_gnn
+        self.use_generalization_aug = use_generalization_aug
+
+        for name, rate in [
+            ("ns_token_dropout_rate", ns_token_dropout_rate),
+            ("seq_token_dropout_rate", seq_token_dropout_rate),
+        ]:
+            if rate < 0.0 or rate >= 1.0:
+                raise ValueError(f"{name} must be in [0, 1), got {rate}")
+        for name, std in [
+            ("ns_token_noise_std", ns_token_noise_std),
+            ("seq_token_noise_std", seq_token_noise_std),
+        ]:
+            if std < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {std}")
+
+        if use_generalization_aug:
+            self.ns_token_dropout_rate = ns_token_dropout_rate
+            self.ns_token_noise_std = ns_token_noise_std
+            self.seq_token_dropout_rate = seq_token_dropout_rate
+            self.seq_token_noise_std = seq_token_noise_std
+        else:
+            self.ns_token_dropout_rate = 0.0
+            self.ns_token_noise_std = 0.0
+            self.seq_token_dropout_rate = 0.0
+            self.seq_token_noise_std = 0.0
 
         # ================== NS Tokens Construction ==================
 
@@ -1686,6 +1717,50 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    def _augment_tokens(
+        self,
+        tokens: torch.Tensor,
+        token_dropout_rate: float,
+        noise_std: float,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply training-only token-level dropout and Gaussian noise.
+
+        Token dropout removes whole token vectors instead of individual
+        dimensions. This is useful for recommendation features because it
+        discourages the model from depending on a single sparse field or a
+        single sequence event. Padding positions remain zeroed when a mask is
+        provided.
+        """
+        if (
+            not self.training
+            or not self.use_generalization_aug
+            or (token_dropout_rate <= 0.0 and noise_std <= 0.0)
+        ):
+            return tokens
+
+        if token_dropout_rate > 0.0:
+            keep_prob = 1.0 - token_dropout_rate
+            keep_shape = tokens.shape[:-1] + (1,)
+            keep = torch.empty(
+                keep_shape,
+                dtype=tokens.dtype,
+                device=tokens.device,
+            ).bernoulli_(keep_prob)
+            tokens = tokens * keep / keep_prob
+
+        if noise_std > 0.0:
+            noise = torch.randn_like(tokens) * noise_std
+            if padding_mask is not None:
+                valid_mask = (~padding_mask).unsqueeze(-1).to(tokens.dtype)
+                noise = noise * valid_mask
+            tokens = tokens + noise
+
+        if padding_mask is not None:
+            tokens = tokens * (~padding_mask).unsqueeze(-1).to(tokens.dtype)
+
+        return tokens
+
     def _build_ns_tokens(self, inputs: ModelInput) -> torch.Tensor:
         """Builds non-sequential tokens and optionally applies GNN-NS.
 
@@ -1706,6 +1781,11 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
+        ns_tokens = self._augment_tokens(
+            ns_tokens,
+            token_dropout_rate=self.ns_token_dropout_rate,
+            noise_std=self.ns_token_noise_std,
+        )
         return self.token_gnn(ns_tokens)
 
     def _run_multi_seq_blocks(
@@ -1772,8 +1852,14 @@ class PCVRHyFormer(nn.Module):
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain])
-            seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
+            tokens = self._augment_tokens(
+                tokens,
+                token_dropout_rate=self.seq_token_dropout_rate,
+                noise_std=self.seq_token_noise_std,
+                padding_mask=mask,
+            )
+            seq_tokens_list.append(tokens)
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
