@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
-    parser.add_argument('--patience', type=int, default=5,
+    parser.add_argument('--patience', type=int, default=3,
                         help='Early-stopping patience '
                              '(number of validations without improvement)')
     parser.add_argument('--seed', type=int, default=42,

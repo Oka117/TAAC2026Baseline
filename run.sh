@@ -2,30 +2,21 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
-# ---- Active config: RTG-HyFormer high-AUC graph plan ----
-# Compared with the old 4-layer NS-only GNN, this run keeps a smaller NS GNN,
-# adds target-aware temporal sequence graphs, directly exposes final NS tokens
-# to the head, and adds element-level graph memory for aligned dense-int lists.
+# ---- Active config: 4LayerGNN + NS-head recovery plan ----
+# This keeps the proven 4-layer NS TokenGNN backbone, returns sequence encoding
+# to the stable Transformer path, and tests only one new low-risk change:
+# exposing final NS tokens directly to the prediction head.
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
-    --seq_encoder_type longer \
-    --seq_top_k 96 \
-    --use_rope \
+    --seq_encoder_type transformer \
     --use_token_gnn \
-    --token_gnn_layers 2 \
-    --token_gnn_layer_scale 0.05 \
-    --use_seq_graph \
-    --seq_graph_layers 2 \
-    --seq_graph_layer_scale 0.08 \
-    --graph_output_fusion \
+    --token_gnn_layers 4 \
+    --token_gnn_layer_scale 0.1 \
     --output_include_ns \
-    --use_aligned_dense_int_graph \
-    --aligned_graph_fids 62,63,64,65,66,89,90,91 \
-    --aligned_graph_layers 1 \
-    --aligned_graph_tokens 8 \
+    --patience 3 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \
