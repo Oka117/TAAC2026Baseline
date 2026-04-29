@@ -39,9 +39,8 @@ logging.basicConfig(
 # Fallback values used only when ``train_config.json`` is missing from the
 # ckpt directory.
 #
-# These MUST match the argparse defaults in ``train.py``; otherwise once the
-# fallback path is actually taken the built model will shape-mismatch the
-# saved state_dict.
+# These mirror the current ``run.sh`` main configuration so the fallback path
+# can still rebuild the submitted model if ``train_config.json`` is missing.
 #
 # Special note on ``num_time_buckets``: this value is strictly determined by
 # ``dataset.BUCKET_BOUNDARIES`` and is NOT an independent hyperparameter.
@@ -50,7 +49,7 @@ logging.basicConfig(
 _FALLBACK_MODEL_CFG = {
     'd_model': 64,
     'emb_dim': 64,
-    'num_queries': 1,
+    'num_queries': 2,
     'num_hyformer_blocks': 2,
     'num_heads': 4,
     'seq_encoder_type': 'transformer',
@@ -63,15 +62,15 @@ _FALLBACK_MODEL_CFG = {
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
-    'emb_skip_threshold': 0,
+    'emb_skip_threshold': 1000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
-    'user_ns_tokens': 0,
-    'item_ns_tokens': 0,
+    'user_ns_tokens': 5,
+    'item_ns_tokens': 2,
     # GNN-NS defaults. These are used only when train_config.json is missing
     # the keys; normal evaluation should read the exact values saved during
     # training.
-    'use_token_gnn': False,
+    'use_token_gnn': True,
     'token_gnn_layers': 4,
     'token_gnn_graph': 'full',
     'token_gnn_layer_scale': 0.1,
@@ -80,7 +79,7 @@ _FALLBACK_MODEL_CFG = {
     'seq_graph_layer_scale': 0.1,
     'seq_graph_use_target': True,
     'graph_output_fusion': True,
-    'output_include_ns': False,
+    'output_include_ns': True,
     'use_aligned_dense_int_graph': False,
     'aligned_graph_fids': '62,63,64,65,66,89,90,91',
     'aligned_graph_layers': 1,
