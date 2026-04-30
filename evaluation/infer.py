@@ -20,6 +20,7 @@ Environment variables:
 import os
 import json
 import logging
+import glob
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -137,6 +138,78 @@ def load_train_config(model_dir: str) -> Dict[str, Any]:
         f"falling back to hardcoded defaults. "
         f"Shape mismatch may occur if training used non-default hyperparameters.")
     return {}
+
+
+def _step_number(path: str) -> int:
+    """Best-effort parser for names like global_step2500.best_model."""
+    base = os.path.basename(os.path.dirname(path))
+    if base.startswith('global_step'):
+        rest = base[len('global_step'):]
+        digits = []
+        for ch in rest:
+            if ch.isdigit():
+                digits.append(ch)
+            else:
+                break
+        if digits:
+            return int(''.join(digits))
+    return -1
+
+
+def resolve_model_dir_and_ckpt_path(model_output_path: str) -> Tuple[str, str]:
+    """Resolve a robust checkpoint directory and ``model.pt`` path.
+
+    Evaluation platforms may pass either the exact ``global_step*.best_model``
+    directory or its parent checkpoint root. This function supports both and
+    chooses a best-model checkpoint when several candidates exist.
+    """
+    if not model_output_path:
+        raise ValueError("MODEL_OUTPUT_PATH is not set")
+    if not os.path.exists(model_output_path):
+        raise FileNotFoundError(
+            f"MODEL_OUTPUT_PATH does not exist: {model_output_path!r}")
+
+    if os.path.isfile(model_output_path):
+        if not model_output_path.endswith('.pt'):
+            raise FileNotFoundError(
+                f"MODEL_OUTPUT_PATH is a file but not a .pt checkpoint: "
+                f"{model_output_path!r}")
+        return os.path.dirname(model_output_path), model_output_path
+
+    direct = sorted(glob.glob(os.path.join(model_output_path, '*.pt')))
+    if direct:
+        model_pt = [
+            p for p in direct if os.path.basename(p) == 'model.pt'
+        ]
+        ckpt_path = model_pt[0] if model_pt else direct[0]
+        return os.path.dirname(ckpt_path), ckpt_path
+
+    patterns = [
+        os.path.join(model_output_path, 'global_step*.best_model', 'model.pt'),
+        os.path.join(model_output_path, 'global_step*', 'model.pt'),
+    ]
+    candidates: List[str] = []
+    seen = set()
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            if path in seen or not os.path.isfile(path):
+                continue
+            candidates.append(path)
+            seen.add(path)
+
+    if not candidates:
+        listing = os.listdir(model_output_path)
+        raise FileNotFoundError(
+            f"No .pt checkpoint found under MODEL_OUTPUT_PATH={model_output_path!r}. "
+            f"Top-level contents: {listing}")
+
+    def _rank(path: str) -> Tuple[int, int, str]:
+        parent = os.path.basename(os.path.dirname(path))
+        is_best = 1 if parent.endswith('.best_model') else 0
+        return (is_best, _step_number(path), path)
+
+    ckpt_path = max(candidates, key=_rank)
+    return os.path.dirname(ckpt_path), ckpt_path
 
 
 def resolve_model_cfg(train_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -274,19 +347,6 @@ def load_model_state_strict(
         raise e
 
 
-def get_ckpt_path() -> Optional[str]:
-    """Locate the first ``*.pt`` file inside the directory pointed at by
-    ``$MODEL_OUTPUT_PATH``. Returns ``None`` if no checkpoint is found.
-    """
-    ckpt_path = os.environ.get("MODEL_OUTPUT_PATH")
-    if not ckpt_path:
-        return None
-    for item in os.listdir(ckpt_path):
-        if item.endswith(".pt"):
-            return os.path.join(ckpt_path, item)
-    return None
-
-
 def _batch_to_model_input(
     batch: Dict[str, Any],
     device: str,
@@ -324,32 +384,64 @@ def _batch_to_model_input(
 
 def main() -> None:
     # ---- Read environment variables ----
-    model_dir = os.environ.get('MODEL_OUTPUT_PATH')
+    model_output_path = os.environ.get('MODEL_OUTPUT_PATH')
     data_dir = os.environ.get('EVAL_DATA_PATH')
     result_dir = os.environ.get('EVAL_RESULT_PATH')
+
+    missing_env = [
+        name for name, value in [
+            ('MODEL_OUTPUT_PATH', model_output_path),
+            ('EVAL_DATA_PATH', data_dir),
+            ('EVAL_RESULT_PATH', result_dir),
+        ]
+        if not value
+    ]
+    if missing_env:
+        raise ValueError(f"Missing required environment variables: {missing_env}")
 
     os.makedirs(result_dir, exist_ok=True)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # ---- Schema: prefer the one from model_dir (to exactly match training);
-    #      fall back to the one in data_dir if missing. ----
-    schema_path = os.path.join(model_dir, 'schema.json')
-    if not os.path.exists(schema_path):
-        schema_path = os.path.join(data_dir, 'schema.json')
+    model_dir, ckpt_path = resolve_model_dir_and_ckpt_path(model_output_path)
+    logging.info(f"Resolved MODEL_OUTPUT_PATH={model_output_path}")
+    logging.info(f"Resolved checkpoint dir: {model_dir}")
+    logging.info(f"Resolved checkpoint file: {ckpt_path}")
+
+    model_output_dir = (
+        model_output_path if os.path.isdir(model_output_path)
+        else os.path.dirname(model_output_path)
+    )
+
+    # ---- Schema: prefer checkpoint sidecars (to exactly match training);
+    #      fall back to the eval data schema if missing. ----
+    schema_candidates = [
+        os.path.join(model_dir, 'schema.json'),
+        os.path.join(model_output_dir, 'schema.json'),
+        os.path.join(data_dir, 'schema.json'),
+    ]
+    schema_path = next((p for p in schema_candidates if os.path.exists(p)), None)
+    if schema_path is None:
+        raise FileNotFoundError(
+            f"schema.json not found. Checked: {schema_candidates}")
     logging.info(f"Using schema: {schema_path}")
 
     # ---- Load train_config.json (single source of truth for all hyperparams) ----
     train_config = load_train_config(model_dir)
+    if not train_config and model_output_dir != model_dir:
+        train_config = load_train_config(model_output_dir)
 
     # ---- Parse seq_max_lens ----
     sml_str = train_config.get('seq_max_lens', _FALLBACK_SEQ_MAX_LENS)
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
-    # ---- Data loading: reuse batch_size / num_workers from training config ----
+    # ---- Data loading: reuse training workers unless explicitly overridden.
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
-    num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+    num_workers = int(os.environ.get(
+        'EVAL_NUM_WORKERS',
+        train_config.get('num_workers', _FALLBACK_NUM_WORKERS),
+    ))
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
@@ -373,9 +465,13 @@ def main() -> None:
     # absolute) path as a fallback.
     ns_groups_json = train_config.get('ns_groups_json', None)
     if ns_groups_json:
-        local_candidate = os.path.join(model_dir, os.path.basename(ns_groups_json))
-        if os.path.exists(local_candidate):
-            ns_groups_json = local_candidate
+        for local_candidate in [
+            os.path.join(model_dir, os.path.basename(ns_groups_json)),
+            os.path.join(model_output_dir, os.path.basename(ns_groups_json)),
+        ]:
+            if os.path.exists(local_candidate):
+                ns_groups_json = local_candidate
+                break
 
     model = build_model(
         test_dataset,
@@ -385,28 +481,19 @@ def main() -> None:
     )
 
     # ---- Strictly load weights ----
-    ckpt_path = get_ckpt_path()
-    if ckpt_path is None:
-        raise FileNotFoundError(
-            f"No *.pt file found under MODEL_OUTPUT_PATH={model_dir!r}. "
-            f"The directory contains: {os.listdir(model_dir) if model_dir and os.path.isdir(model_dir) else 'N/A'}. "
-            "This typically means the training job wrote only the sidecar "
-            "files (schema.json / train_config.json) for this step but did "
-            "not persist model.pt — a symptom of a race between "
-            "_remove_old_best_dirs and EarlyStopping.save_checkpoint."
-        )
     logging.info(f"Loading checkpoint from {ckpt_path}")
     load_model_state_strict(model, ckpt_path, device)
     model.eval()
     logging.info("Model loaded successfully")
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=None,
-        num_workers=num_workers,
-        prefetch_factor=2,
-        pin_memory=torch.cuda.is_available(),
-    )
+    loader_kwargs: Dict[str, Any] = {
+        'batch_size': None,
+        'num_workers': num_workers,
+        'pin_memory': torch.cuda.is_available(),
+    }
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 2
+    test_loader = DataLoader(test_dataset, **loader_kwargs)
 
     all_probs = []
     all_user_ids = []
@@ -427,10 +514,22 @@ def main() -> None:
                 logging.info(f"  Processed {(batch_idx + 1) * batch_size} samples")
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
+    logging.info(
+        f"Prediction accounting: total_test_samples={total_test_samples}, "
+        f"len(all_probs)={len(all_probs)}, len(all_user_ids)={len(all_user_ids)}")
+    if len(all_probs) != total_test_samples:
+        logging.warning(
+            f"Prediction count mismatch: expected {total_test_samples}, "
+            f"got {len(all_probs)}")
 
     predictions = {
         "predictions": dict(zip(all_user_ids, all_probs)),
     }
+    if len(predictions["predictions"]) != len(all_probs):
+        logging.warning(
+            "Duplicate user_id values detected; dict output has fewer entries "
+            f"({len(predictions['predictions'])}) than predictions ({len(all_probs)}). "
+            "Keeping baseline output format.")
 
     # ---- Save predictions.json ----
     output_path = os.path.join(result_dir, 'predictions.json')
