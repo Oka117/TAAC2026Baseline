@@ -18,6 +18,7 @@ P002: dense numerical normalization
 | `run_fe00.sh` | 本地别名，直接委托 `run.sh` |
 | `build_fe00_preprocess_dataset.py` | 生成 FE-00 parquet/schema/ns_groups 与对齐报告 |
 | `dataset.py` | 训练数据读取，兼容 FE-00 输出 schema |
+| `trainer.py` | 保存 checkpoint 时打包 FE-00 stats sidecar，供严格评估复用 |
 
 ## 文档文件
 
@@ -33,6 +34,7 @@ FE-00 最小需要更新：
 run.sh
 build_fe00_preprocess_dataset.py
 dataset.py
+trainer.py
 ns_groups.json
 ```
 
@@ -41,7 +43,6 @@ ns_groups.json
 ```text
 model.py
 train.py
-trainer.py
 utils.py
 ```
 
@@ -50,6 +51,19 @@ utils.py
 ```text
 run.sh -> build_fe00_preprocess_dataset.py -> FE00_ROOT/schema.json
 run.sh -> FE00_ROOT/ns_groups.fe00.json -> train.py
+trainer.py -> checkpoint/int_fill_values.json
+trainer.py -> checkpoint/dense_normalization_stats.json
+```
+
+重新训练后的 best checkpoint 应包含：
+
+```text
+model.pt
+schema.json
+ns_groups.fe00.json
+train_config.json
+int_fill_values.json
+dense_normalization_stats.json
 ```
 
 默认训练参数：

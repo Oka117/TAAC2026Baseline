@@ -19,6 +19,7 @@ P022/P023: min_match_delta 与 match_count_7d dense
 | `build_feature_engineering_dataset.py` | 生成 FE-01 parquet/schema/ns_groups/stats/DOCX 对齐报告 |
 | `ns_groups.feature_engineering.json` | FE-01 推荐 int-only NS groups |
 | `dataset.py` | 读取 `item_dense`，让新增 item dense token 进入模型 |
+| `trainer.py` | 保存 checkpoint 时打包 FE-01 stats sidecar，供严格评估复用 |
 
 ## 文档文件
 
@@ -34,6 +35,7 @@ FE-01 最小需要更新：
 dataset.py
 build_feature_engineering_dataset.py
 ns_groups.feature_engineering.json
+trainer.py
 ```
 
 如果平台只能执行固定的 `run.sh`，需要把 `run_fe01.sh` 的内容上传/覆盖为平台 `run.sh`。当前仓库根目录 `run.sh` 保留为 FE-00 入口，避免两个实验入口混淆。
@@ -43,7 +45,6 @@ ns_groups.feature_engineering.json
 ```text
 model.py
 train.py
-trainer.py
 utils.py
 ```
 
@@ -53,6 +54,17 @@ utils.py
 run_fe01.sh -> build_feature_engineering_dataset.py -> FE01_ROOT/schema.json
 run_fe01.sh -> FE01_ROOT/ns_groups.feature_engineering.json -> train.py
 dataset.py -> item_dense_feats -> model.py item_dense_proj
+trainer.py -> checkpoint/feature_engineering_stats.json
+```
+
+重新训练后的 best checkpoint 应包含：
+
+```text
+model.pt
+schema.json
+ns_groups.feature_engineering.json
+train_config.json
+feature_engineering_stats.json
 ```
 
 默认训练参数：

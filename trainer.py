@@ -128,7 +128,7 @@ class PCVRHyFormerRankingTrainer:
     def _write_sidecar_files(self, ckpt_dir: str) -> None:
         """Write sidecar files next to a ``model.pt``.
 
-        Currently persists up to three files, all overwritten on every call:
+        Currently persists checkpoint sidecar files, all overwritten on every call:
 
         - ``schema.json`` (copied from ``self.schema_path``): feature layout
           metadata needed to rebuild the Parquet dataset.
@@ -137,6 +137,10 @@ class PCVRHyFormerRankingTrainer:
           tokenizer. Making a per-ckpt copy lets evaluation environments
           consume the checkpoint without having to ship the original
           project-level ``ns_groups.json``.
+        - FE experiment transform-state files when they exist next to
+          ``schema.json``. FE-00 exact evaluation needs
+          ``int_fill_values.json`` and ``dense_normalization_stats.json``;
+          FE-01 exact evaluation needs ``feature_engineering_stats.json``.
         - ``train_config.json`` (serialized from ``self.train_config``):
           full set of training-time hyperparameters. When ``ns_groups.json``
           is copied into ``ckpt_dir``, the ``ns_groups_json`` field is
@@ -147,6 +151,25 @@ class PCVRHyFormerRankingTrainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         if self.schema_path and os.path.exists(self.schema_path):
             shutil.copy2(self.schema_path, ckpt_dir)
+            schema_dir = os.path.dirname(os.path.abspath(self.schema_path))
+            for sidecar_name in (
+                # FE-00 transform state; required for exact transform-only
+                # evaluation on raw eval parquet.
+                'int_fill_values.json',
+                'dense_normalization_stats.json',
+                # Useful FE-00 audit sidecars.
+                'dropped_user_int_fids.json',
+                'feature_missing_report.json',
+                'docx_alignment.fe00.json',
+                # Useful FE-01 audit sidecars if later experiments reuse the
+                # same checkpoint packaging path.
+                'feature_engineering_stats.json',
+                'docx_alignment.fe01.json',
+            ):
+                sidecar_path = os.path.join(schema_dir, sidecar_name)
+                if os.path.exists(sidecar_path):
+                    shutil.copy2(sidecar_path, ckpt_dir)
+                    logging.info(f"Copied checkpoint sidecar: {sidecar_name}")
 
         ns_groups_copied = False
         if self.ns_groups_path and os.path.exists(self.ns_groups_path):
