@@ -6,6 +6,29 @@
 
 本次实验只增强输入特征和 NS 分组，不修改 HyFormer block，不引入 delay-aware loss，不做 multi-task。这样实验变量比较干净，方便判断“新增特征本身”是否有效。
 
+当前已生成代码：
+
+```text
+build_feature_engineering_dataset.py
+run_fe01.sh
+ns_groups.feature_engineering.json
+dataset.py
+```
+
+实际训练关系说明：
+
+```text
+run_fe01.sh 是 FE-01 的一键实验入口。
+build_feature_engineering_dataset.py 不替换 dataset.py，它先生成 FE-01 parquet/schema。
+训练时仍然由 train.py + dataset.py 读取 FE-01 输出目录下的 schema.json 和 parquet。
+```
+
+也就是说，实际流程是：
+
+```text
+原始 parquet/schema -> run_fe01.sh -> build_feature_engineering_dataset.py -> FE-01 输出目录 -> train.py/dataset.py
+```
+
 ## 2. 实验假设
 
 用户/物品历史频次、购买频次，以及目标 item 属性与历史行为序列的匹配信号，能补充当前序列 token 和 NS token 没有显式表达的统计信息，从而提升 CVR 预测效果。
@@ -87,7 +110,7 @@ multi-task loss
 build_feature_engineering_dataset.py
 ```
 
-当前仓库已提供该脚本。它会输出增强 parquet、增强 `schema.json`、`ns_groups.feature_engineering.json` 和 `feature_engineering_stats.json`。
+当前仓库已提供该脚本。它会输出增强 parquet、增强 `schema.json`、`ns_groups.feature_engineering.json`、`feature_engineering_stats.json` 和 `docx_alignment.fe01.json`。
 
 输入：
 
@@ -107,7 +130,7 @@ python3 build_feature_engineering_dataset.py \
 | --- | ---: | --- |
 | `timestamp` | 固定列 | 用于 prefix 统计和防泄漏 |
 | `label_type` | 固定列 | `label_type == 2` 作为 purchase/conversion |
-| prefix 统计 | 固定为不包含当前样本 | 先产出特征，再更新当前样本状态 |
+| prefix 统计 | 固定为不包含当前样本 | batch 内按 timestamp 稳定排序，先产出特征，再更新当前样本状态 |
 | `--match_window_days` | `7` | 计算 `match_count_7d` |
 | `--match_count_buckets` | `0,1,2,4,8` | `item_int_feats_90` 的 count 分桶边界，生成 0-5 编码 |
 | dense transform | 固定为 `log1p,zscore` | 脚本两遍扫描：先拟合均值方差，再写增强 parquet |
@@ -118,6 +141,7 @@ python3 build_feature_engineering_dataset.py \
 防泄漏要求：
 
 - 所有 user/item frequency 必须只统计当前样本 `timestamp` 之前的数据。
+- 全局严格防泄漏要求输入 parquet/row group 按时间或训练可见顺序排列；脚本能保证 batch 内 timestamp 顺序，但不能重排跨 row group 的物理顺序。
 - `purchase_frequency` 只能使用历史中已经观测到的正样本。
 - validation/test 的统计只能来自训练历史或当前行之前的可见历史，不能使用未来行。
 - 当前样本的 `label_time` 不进入模型输入。
@@ -205,14 +229,16 @@ FE-01 推荐训练命令：
 
 ```bash
 bash run_fe01.sh \
-  --data_dir /path/to/fe01_dataset \
-  --schema_path /path/to/fe01_dataset/schema.json \
+  --data_dir /path/to/original_dataset \
+  --schema_path /path/to/original_dataset/schema.json \
   --ckpt_dir outputs/exp_fe01_safe_features/ckpt \
   --log_dir outputs/exp_fe01_safe_features/log \
   --seed 42
 ```
 
-`run_fe01.sh` 内部已经固定 FE-01 推荐模型参数；如需覆盖，可以继续在命令尾部追加同名参数。
+`run_fe01.sh` 会先生成 FE-01 输出目录，再自动把训练阶段的 `TRAIN_DATA_PATH`、`--schema_path`、`--ns_groups_json` 指向 FE-01 输出目录。若平台 `/tmp` 空间不足，可设置 `FE01_DATA_DIR=/path/to/writable_scratch`。
+
+平台如果只能执行固定的 `run.sh`，则 FE-01 提交时需要把 `run_fe01.sh` 的内容上传/覆盖为平台的 `run.sh`；当前根目录 `run.sh` 仍保留为 FE-00 入口。
 
 关键参数解释：
 
@@ -225,6 +251,8 @@ bash run_fe01.sh \
 | `--d_model` | `64` | 与 baseline 保持一致 |
 | `--loss_type` | `bce` | 第一次实验不混入 loss 变量 |
 | `--seq_max_lens` | `a/b=256,c/d=512` | 沿用当前默认配置 |
+| `--patience` | `3` | 与 FE-00 当前实验轮数设置保持一致 |
+| `--num_epochs` | `6` | 与 FE-00 当前实验轮数设置保持一致 |
 
 加入 item dense token 后：
 
@@ -248,6 +276,7 @@ FE-01 至少需要两处代码修改：
 
 1. 新增 `build_feature_engineering_dataset.py`。
 2. 修改 `dataset.py`，支持从 schema 读取 `item_dense` 并返回非空 `item_dense_feats`。
+3. 新增/更新 `run_fe01.sh`，负责原始数据到 FE-01 数据再到训练的一键链路。
 
 `model.py` 第一轮不需要改，因为当前已经有：
 

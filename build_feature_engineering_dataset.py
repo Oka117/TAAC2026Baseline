@@ -1,7 +1,7 @@
 """Build the FE-01 feature-engineering parquet dataset.
 
 This script implements the first experiment plan in
-``experiment_plans/experiment_01_feature_engineering_plan.zh.md``.
+``experiment_plans/FE01/experiment_01_feature_engineering_plan.zh.md``.
 
 It streams parquet files in sorted file / row-group order and creates:
 
@@ -144,7 +144,8 @@ def build_augmented_schema(schema: Dict[str, Any], match_count_vocab_size: int) 
 
 def build_ns_groups() -> Dict[str, Any]:
     return {
-        "_purpose": "FE-01 NS groups. Dense feature ids are intentionally omitted; they enter through dense tokens.",
+        "_purpose": "FE-01 NS groups. Dense feature ids are intentionally omitted; they enter through user/item dense tokens.",
+        "_note": "Use with --ns_tokenizer_type rankmixer --user_ns_tokens 6 --item_ns_tokens 4 --num_queries 1 when item_dense is enabled.",
         "user_ns_groups": {
             "U1_user_profile": [1, 15, 48, 49],
             "U2_user_behavior_stats": [50, 60],
@@ -164,6 +165,28 @@ def build_ns_groups() -> Dict[str, Any]:
             "I4_target_matching_fields": [89, 90],
         },
     }
+
+
+def filter_ns_groups(ns_groups: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_user_fids = {int(row[0]) for row in schema.get("user_int", [])}
+    allowed_item_fids = {int(row[0]) for row in schema.get("item_int", [])}
+    out: Dict[str, Any] = {
+        k: v for k, v in ns_groups.items()
+        if not k.startswith("user_ns_groups") and not k.startswith("item_ns_groups")
+    }
+    user_groups = {}
+    for name, fids in ns_groups.get("user_ns_groups", {}).items():
+        kept = [int(fid) for fid in fids if int(fid) in allowed_user_fids]
+        if kept:
+            user_groups[name] = kept
+    item_groups = {}
+    for name, fids in ns_groups.get("item_ns_groups", {}).items():
+        kept = [int(fid) for fid in fids if int(fid) in allowed_item_fids]
+        if kept:
+            item_groups[name] = kept
+    out["user_ns_groups"] = user_groups
+    out["item_ns_groups"] = item_groups
+    return out
 
 
 def _strip_prefix(prefix: str) -> str:
@@ -196,7 +219,7 @@ def resolve_domain_d_columns(schema: Dict[str, Any], parquet_names: Sequence[str
 
 
 def _to_int_array(arr: pa.Array) -> np.ndarray:
-    return arr.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    return arr.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
 
 
 def _first_scalar_from_maybe_list(values: Iterable[Any]) -> np.ndarray:
@@ -260,7 +283,10 @@ def _compute_raw_features(
     min_match_delta = np.zeros(B, dtype=np.float32)
     match_count_7d = np.zeros(B, dtype=np.float32)
 
-    for i in range(B):
+    # Compute prefix features in timestamp order inside each batch, while
+    # writing results back to the original row positions.
+    row_order = np.argsort(timestamps, kind="stable")
+    for i in row_order:
         uid = int(user_ids[i])
         iid = int(item_ids[i])
         label_is_purchase = int(labels[i]) == 2
@@ -343,6 +369,13 @@ def _normalize(name: str, values: np.ndarray, stats: Dict[str, RunningStats]) ->
     return ((values.astype(np.float32) - tracker.mean) / tracker.std).astype(np.float32)
 
 
+def _append_or_replace_column(table: pa.Table, name: str, values: pa.Array) -> pa.Table:
+    idx = table.schema.get_field_index(name)
+    if idx == -1:
+        return table.append_column(name, values)
+    return table.set_column(idx, name, values)
+
+
 def write_augmented_parquet(
     row_groups: Sequence[Tuple[str, int]],
     output_dir: str,
@@ -368,12 +401,14 @@ def write_augmented_parquet(
                 "item_dense_feats_91",
                 "item_dense_feats_92",
             ]:
-                table = table.append_column(
+                table = _append_or_replace_column(
+                    table,
                     name,
                     pa.array(_normalize(name, feats[name], stats), type=pa.float32()),
                 )
             for name in ["item_int_feats_89", "item_int_feats_90"]:
-                table = table.append_column(name, pa.array(feats[name], type=pa.int64()))
+                table = _append_or_replace_column(
+                    table, name, pa.array(feats[name], type=pa.int64()))
 
             out_path = os.path.join(output_dir, os.path.basename(input_path))
             writer = writers.get(out_path)
@@ -393,6 +428,77 @@ def parse_edges(raw: str) -> List[int]:
     if any(b <= a for a, b in zip(edges, edges[1:])):
         raise ValueError("--match_count_buckets must be strictly increasing")
     return edges
+
+
+def build_alignment(
+    match_col: str,
+    match_ts_col: str,
+    count_edges: Sequence[int],
+    match_window_days: int,
+) -> Dict[str, Any]:
+    return {
+        "source_docx": "/Users/gaogang/Downloads/feature-engineering.docx",
+        "experiment": "FE-01",
+        "not_included": [
+            "user_dense_feats_112 / item_dense_feats_88 avg delay",
+            "delay-aware weighted loss",
+            "multi-task learning",
+        ],
+        "mappings": [
+            {
+                "docx_ref": "P008",
+                "docx_text": "user_dense_feats_110 = log(1+user_total_frequency)",
+                "implementation": "Prefix user total count before current timestamp, log1p then train-row-group z-score.",
+                "output_column": "user_dense_feats_110",
+            },
+            {
+                "docx_ref": "P012",
+                "docx_text": "user_dense_feats_111 = log(1+user_purchase_frequency)",
+                "implementation": "Prefix user purchase count where historical label_type == 2, log1p then train-row-group z-score.",
+                "output_column": "user_dense_feats_111",
+            },
+            {
+                "docx_ref": "P010",
+                "docx_text": "item_dense_feats_86 = log(1+item_total_frequency)",
+                "implementation": "Prefix item total count before current timestamp, log1p then train-row-group z-score.",
+                "output_column": "item_dense_feats_86",
+            },
+            {
+                "docx_ref": "P014",
+                "docx_text": "item_dense_feats_87 = log(1+item_purchase_frequency)",
+                "implementation": "Prefix item purchase count where historical label_type == 2, log1p then train-row-group z-score.",
+                "output_column": "item_dense_feats_87",
+            },
+            {
+                "docx_ref": "P020",
+                "docx_text": "Item_int_feats_89 = has_match(item_int_feats_9, domain_d_seq_19)",
+                "implementation": "0=missing target, 1=no match, 2=has match.",
+                "output_column": "item_int_feats_89",
+                "match_column": match_col,
+            },
+            {
+                "docx_ref": "P021",
+                "docx_text": "Item_int_feats_90 = match_count(item_int_feats_9, domain_d_seq_19)",
+                "implementation": "Bucketized match_count for Embedding compatibility; raw continuous count is not used as an id.",
+                "output_column": "item_int_feats_90",
+                "bucket_edges": list(map(int, count_edges)),
+            },
+            {
+                "docx_ref": "P022",
+                "docx_text": "item_dense_feats_91 = log(1+min_match_delta)",
+                "implementation": "Minimum timestamp - matched domain_d event timestamp, log1p then train-row-group z-score.",
+                "output_column": "item_dense_feats_91",
+                "timestamp_column": match_ts_col,
+            },
+            {
+                "docx_ref": "P023",
+                "docx_text": "item_dense_feats_92 = log(1+match_count_7d)",
+                "implementation": "Count matches whose timestamp delta is within the configured day window, log1p then train-row-group z-score.",
+                "output_column": "item_dense_feats_92",
+                "match_window_days": int(match_window_days),
+            },
+        ],
+    }
 
 
 def main() -> None:
@@ -438,8 +544,9 @@ def main() -> None:
         match_col, match_ts_col, match_window_seconds, count_edges)
 
     augmented_schema = build_augmented_schema(schema, match_count_vocab_size=len(count_edges) + 1)
+    output_ns_groups = filter_ns_groups(build_ns_groups(), augmented_schema)
     _write_json(os.path.join(args.output_dir, "schema.json"), augmented_schema)
-    _write_json(os.path.join(args.output_dir, "ns_groups.feature_engineering.json"), build_ns_groups())
+    _write_json(os.path.join(args.output_dir, "ns_groups.feature_engineering.json"), output_ns_groups)
     _write_json(
         os.path.join(args.output_dir, "feature_engineering_stats.json"),
         {
@@ -451,8 +558,12 @@ def main() -> None:
             "fit_stats_row_group_ratio": args.fit_stats_row_group_ratio,
             "fit_stats_row_groups": len(fit_row_groups),
             "total_row_groups": len(row_groups),
-            "leakage_note": "Prefix frequency features are based only on rows already seen in stream order.",
+            "leakage_note": "Prefix features are computed in timestamp order within each batch and use only previously seen stream state. For a global guarantee, feed timestamp-sorted parquet/row groups.",
         },
+    )
+    _write_json(
+        os.path.join(args.output_dir, "docx_alignment.fe01.json"),
+        build_alignment(match_col, match_ts_col, count_edges, args.match_window_days),
     )
     print(f"Wrote FE-01 dataset to: {args.output_dir}")
 

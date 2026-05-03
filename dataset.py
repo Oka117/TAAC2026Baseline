@@ -500,7 +500,7 @@ class PCVRParquetDataset(IterableDataset):
     ) -> "npt.NDArray[np.float32]":
         """Pad an Arrow float scalar/list column to shape ``[B, max_dim]``."""
         if not pa.types.is_list(arrow_col.type):
-            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32)
+            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32, copy=True)
             padded = np.zeros((B, max_dim), dtype=np.float32)
             if max_dim > 0:
                 padded[:, 0] = arr
@@ -545,7 +545,7 @@ class PCVRParquetDataset(IterableDataset):
         for ci, dim, offset, vs in self._user_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
                 arr[arr <= 0] = 0
                 if vs > 0:
                     self._record_oob('user_int', ci, arr, vs)
@@ -566,7 +566,7 @@ class PCVRParquetDataset(IterableDataset):
         for ci, dim, offset, vs in self._item_int_plan:
             col = batch.column(ci)
             if dim == 1:
-                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
+                arr = col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
                 arr[arr <= 0] = 0
                 if vs > 0:
                     self._record_oob('item_int', ci, arr, vs)

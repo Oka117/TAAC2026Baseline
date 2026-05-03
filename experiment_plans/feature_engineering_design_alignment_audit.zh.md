@@ -31,8 +31,8 @@
 
 | DOCX 设计点 | 当前对应文件 | 状态 | 说明 |
 | --- | --- | --- | --- |
-| 删除缺失率 `>75%` user int | `build_fe00_preprocess_dataset.py`，`experiment_00_preprocess_alignment_plan.zh.md` | 已实现 | FE-00 输出 `schema.json`、`ns_groups.fe00.json`、`dropped_user_int_fids.json` |
-| int missing average fill | `build_fe00_preprocess_dataset.py`，`experiment_00_preprocess_alignment_plan.zh.md` | 已实现但需 baseline 适配 | user/item int missing 使用 train positive mean 填补；sequence id 不做 average fill |
+| 删除缺失率 `>75%` user int | `build_fe00_preprocess_dataset.py`，`FE00/experiment_00_preprocess_alignment_plan.zh.md` | 已实现 | FE-00 输出 `schema.json`、`ns_groups.fe00.json`、`dropped_user_int_fids.json` |
+| int missing average fill | `build_fe00_preprocess_dataset.py`，`FE00/experiment_00_preprocess_alignment_plan.zh.md` | 已实现但需 baseline 适配 | user/item int missing 使用 train positive mean 填补；sequence id 不做 average fill |
 | dense numerical normalization | `build_fe00_preprocess_dataset.py`，`build_feature_engineering_dataset.py` | 已实现 | FE-00 处理原始 dense，FE-01 处理新增 dense |
 | `user_dense_feats_110/111` | `build_feature_engineering_dataset.py`，FE-01 | 已实现 | prefix frequency，不包含当前样本 |
 | `item_dense_feats_86/87` | `build_feature_engineering_dataset.py`，FE-01 | 已实现 | 依赖 `dataset.py` item dense 支持 |
@@ -41,7 +41,7 @@
 | `item_int_feats_89` | `build_feature_engineering_dataset.py`，FE-01 | 已实现 | 编码为 0/1/2 |
 | `item_int_feats_90` | `build_feature_engineering_dataset.py`，FE-01 | 已实现但 baseline 适配 | DOCX 为 raw `match_count`；baseline 用 Embedding，故分桶为 categorical count |
 | `item_dense_feats_91/92` | `build_feature_engineering_dataset.py`，FE-01 | 已实现 | 使用 domain_d sequence timestamp 计算 |
-| lift 筛选其他 pair | `experiment_00_preprocess_alignment_plan.zh.md` | 已规划 | 不在 FE-01 直接扩展 pair，避免偏离 DOCX 第一组 |
+| lift 筛选其他 pair | `FE00/experiment_00_preprocess_alignment_plan.zh.md` | 已规划 | 不在 FE-01 直接扩展 pair，避免偏离 DOCX 第一组 |
 | NS groups | `ns_groups.feature_engineering.json`，FE-01 | 已实现但 baseline 适配 | dense fid 不写入 int-only NS groups，通过 dense token 进入 |
 | Delay-aware weighted loss | FE-03 | 已规划 | 使用 `delay = timestamp - label_time` |
 | Multi-task conversion/delay/engagement | FE-04 | 已规划 | 已补齐 engagement head/label 设计 |

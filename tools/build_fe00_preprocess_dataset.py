@@ -245,7 +245,7 @@ def fill_int_column(col: pa.Array, fill_value: int, fill_empty_lists: bool) -> p
                 for x in row
             ])
         return pa.array(rows, type=pa.list_(pa.int64()))
-    arr = scalar_int_values(col)
+    arr = scalar_int_values(col).copy()
     arr[arr <= 0] = fill_value
     return pa.array(arr, type=pa.int64())
 
@@ -266,7 +266,7 @@ def normalize_dense_column(col: pa.Array, stats: RunningStats) -> pa.Array:
             rows.append(new_row)
         return pa.array(rows, type=pa.list_(pa.float32()))
 
-    arr = col.fill_null(mean).to_numpy(zero_copy_only=False).astype(np.float32)
+    arr = col.fill_null(mean).to_numpy(zero_copy_only=False).astype(np.float32, copy=True)
     arr = np.nan_to_num(arr, nan=mean, posinf=mean, neginf=mean)
     return pa.array(((arr - mean) / std).astype(np.float32), type=pa.float32())
 
