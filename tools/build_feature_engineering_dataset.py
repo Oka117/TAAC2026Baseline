@@ -1,14 +1,18 @@
-"""Build the FE-01 feature-engineering parquet dataset.
+"""Build FE-01 / FE-02 feature-engineering parquet datasets.
 
-This script implements the first experiment plan in
-``experiment_plans/FE01/experiment_01_feature_engineering_plan.zh.md``.
+This script implements the FE-01 plan in
+``experiment_plans/FE01/experiment_01_feature_engineering_plan.zh.md`` and,
+when ``--enable_delay_history`` is set, the incremental FE-02 plan in
+``experiment_plans/FE02/experiment_02_delay_history_features_plan.zh.md``.
 
 It streams parquet files in sorted file / row-group order and creates:
 
 - user_dense_feats_110: log1p(prefix user total frequency), z-scored
 - user_dense_feats_111: log1p(prefix user purchase frequency), z-scored
+- user_dense_feats_112: log1p(prefix user avg delay), z-scored (FE-02 only)
 - item_dense_feats_86: log1p(prefix item total frequency), z-scored
 - item_dense_feats_87: log1p(prefix item purchase frequency), z-scored
+- item_dense_feats_88: log1p(prefix item avg delay), z-scored (FE-02 only)
 - item_int_feats_89: has_match(item_int_feats_9, domain_d_seq_19)
 - item_int_feats_90: bucketized match_count(item_int_feats_9, domain_d_seq_19)
 - item_dense_feats_91: log1p(min_match_delta), z-scored
@@ -17,6 +21,11 @@ It streams parquet files in sorted file / row-group order and creates:
 The prefix frequency features are computed from rows already seen by the
 streaming pass. For leakage safety, feed this script data ordered by timestamp
 or by the same historical order used by training.
+
+FE-02 delay history also uses only previously seen conversion rows. It follows
+the uploaded DOCX definition ``delay = timestamp - label_time``; negative delay
+values are counted in the audit stats and clipped to zero before averaging so
+that ``log1p`` stays well-defined.
 """
 
 from __future__ import annotations
@@ -36,8 +45,23 @@ import pyarrow.parquet as pq
 
 
 USER_DENSE_ADDS = [(110, 1), (111, 1)]
+USER_DELAY_DENSE_ADDS = [(112, 1)]
 ITEM_DENSE_ADDS = [(86, 1), (87, 1), (91, 1), (92, 1)]
+ITEM_DELAY_DENSE_ADDS = [(88, 1)]
 ITEM_INT_BASE_ADDS = [(89, 3, 1)]
+
+BASE_DENSE_FEATURE_NAMES = [
+    "user_dense_feats_110",
+    "user_dense_feats_111",
+    "item_dense_feats_86",
+    "item_dense_feats_87",
+    "item_dense_feats_91",
+    "item_dense_feats_92",
+]
+DELAY_DENSE_FEATURE_NAMES = [
+    "user_dense_feats_112",
+    "item_dense_feats_88",
+]
 
 
 @dataclass
@@ -71,25 +95,74 @@ class PrefixState:
         self.user_purchase: DefaultDict[int, int] = defaultdict(int)
         self.item_total: DefaultDict[int, int] = defaultdict(int)
         self.item_purchase: DefaultDict[int, int] = defaultdict(int)
+        self.user_delay_sum: DefaultDict[int, float] = defaultdict(float)
+        self.user_delay_count: DefaultDict[int, int] = defaultdict(int)
+        self.item_delay_sum: DefaultDict[int, float] = defaultdict(float)
+        self.item_delay_count: DefaultDict[int, int] = defaultdict(int)
+        self.delay_observed_count: int = 0
+        self.delay_negative_count: int = 0
 
     def before_update(
         self,
         user_id: int,
         item_id: int,
-    ) -> Tuple[int, int, int, int]:
+    ) -> Tuple[int, int, int, int, float, float]:
+        user_delay_count = self.user_delay_count[user_id]
+        item_delay_count = self.item_delay_count[item_id]
+        user_avg_delay = (
+            self.user_delay_sum[user_id] / user_delay_count
+            if user_delay_count > 0 else 0.0
+        )
+        item_avg_delay = (
+            self.item_delay_sum[item_id] / item_delay_count
+            if item_delay_count > 0 else 0.0
+        )
         return (
             self.user_total[user_id],
             self.user_purchase[user_id],
             self.item_total[item_id],
             self.item_purchase[item_id],
+            user_avg_delay,
+            item_avg_delay,
         )
 
-    def update(self, user_id: int, item_id: int, is_purchase: bool) -> None:
+    def update(
+        self,
+        user_id: int,
+        item_id: int,
+        is_purchase: bool,
+        timestamp: Optional[int] = None,
+        label_time: Optional[int] = None,
+        collect_delay: bool = False,
+    ) -> None:
         self.user_total[user_id] += 1
         self.item_total[item_id] += 1
         if is_purchase:
             self.user_purchase[user_id] += 1
             self.item_purchase[item_id] += 1
+            if collect_delay and timestamp is not None and label_time is not None and label_time > 0:
+                raw_delay = int(timestamp) - int(label_time)
+                self.delay_observed_count += 1
+                if raw_delay < 0:
+                    self.delay_negative_count += 1
+                    raw_delay = 0
+                self.user_delay_sum[user_id] += float(raw_delay)
+                self.user_delay_count[user_id] += 1
+                self.item_delay_sum[item_id] += float(raw_delay)
+                self.item_delay_count[item_id] += 1
+
+    def delay_quality(self) -> Dict[str, Any]:
+        ratio = (
+            self.delay_negative_count / self.delay_observed_count
+            if self.delay_observed_count > 0 else 0.0
+        )
+        return {
+            "observed_positive_label_with_label_time": self.delay_observed_count,
+            "negative_delay_count": self.delay_negative_count,
+            "negative_delay_ratio": ratio,
+            "delay_formula": "timestamp - label_time",
+            "negative_delay_policy": "clip_to_zero_before_log1p_avg",
+        }
 
 
 def _parquet_files(input_dir: str) -> List[str]:
@@ -131,10 +204,26 @@ def _append_feature_specs(
     return [by_fid[fid] for fid in sorted(by_fid)]
 
 
-def build_augmented_schema(schema: Dict[str, Any], match_count_vocab_size: int) -> Dict[str, Any]:
+def dense_feature_names(enable_delay_history: bool) -> List[str]:
+    names = list(BASE_DENSE_FEATURE_NAMES)
+    if enable_delay_history:
+        names.extend(DELAY_DENSE_FEATURE_NAMES)
+    return names
+
+
+def build_augmented_schema(
+    schema: Dict[str, Any],
+    match_count_vocab_size: int,
+    enable_delay_history: bool = False,
+) -> Dict[str, Any]:
     out = dict(schema)
-    out["user_dense"] = _append_feature_specs(out.get("user_dense", []), USER_DENSE_ADDS)
-    out["item_dense"] = _append_feature_specs(out.get("item_dense", []), ITEM_DENSE_ADDS)
+    user_dense_adds = list(USER_DENSE_ADDS)
+    item_dense_adds = list(ITEM_DENSE_ADDS)
+    if enable_delay_history:
+        user_dense_adds.extend(USER_DELAY_DENSE_ADDS)
+        item_dense_adds.extend(ITEM_DELAY_DENSE_ADDS)
+    out["user_dense"] = _append_feature_specs(out.get("user_dense", []), user_dense_adds)
+    out["item_dense"] = _append_feature_specs(out.get("item_dense", []), item_dense_adds)
     out["item_int"] = _append_feature_specs(
         out.get("item_int", []),
         [*ITEM_INT_BASE_ADDS, (90, match_count_vocab_size, 1)],
@@ -144,7 +233,7 @@ def build_augmented_schema(schema: Dict[str, Any], match_count_vocab_size: int) 
 
 def build_ns_groups() -> Dict[str, Any]:
     return {
-        "_purpose": "FE-01 NS groups. Dense feature ids are intentionally omitted; they enter through user/item dense tokens.",
+        "_purpose": "FE-01/FE-02 NS groups. Dense feature ids are intentionally omitted; they enter through user/item dense tokens.",
         "_note": "Use with --ns_tokenizer_type rankmixer --user_ns_tokens 6 --item_ns_tokens 4 --num_queries 1 when item_dense is enabled.",
         "user_ns_groups": {
             "U1_user_profile": [1, 15, 48, 49],
@@ -257,6 +346,7 @@ def _compute_raw_features(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
+    enable_delay_history: bool = False,
 ) -> Dict[str, np.ndarray]:
     names = batch.schema.names
     idx = {name: i for i, name in enumerate(names)}
@@ -266,6 +356,12 @@ def _compute_raw_features(
     item_ids = _to_int_array(batch.column(idx["item_id"]))
     labels = _to_int_array(batch.column(idx["label_type"]))
     timestamps = _to_int_array(batch.column(idx["timestamp"]))
+    if enable_delay_history:
+        if "label_time" not in idx:
+            raise KeyError("FE-02 requires label_time in the input parquet")
+        label_times = _to_int_array(batch.column(idx["label_time"]))
+    else:
+        label_times = np.zeros(B, dtype=np.int64)
 
     if "item_int_feats_9" not in idx:
         raise KeyError("FE-01 requires item_int_feats_9 in the input parquet")
@@ -278,6 +374,8 @@ def _compute_raw_features(
     user_purchase = np.zeros(B, dtype=np.float32)
     item_total = np.zeros(B, dtype=np.float32)
     item_purchase = np.zeros(B, dtype=np.float32)
+    user_avg_delay = np.zeros(B, dtype=np.float32)
+    item_avg_delay = np.zeros(B, dtype=np.float32)
     has_match = np.zeros(B, dtype=np.int64)
     match_count = np.zeros(B, dtype=np.int64)
     min_match_delta = np.zeros(B, dtype=np.float32)
@@ -290,11 +388,13 @@ def _compute_raw_features(
         uid = int(user_ids[i])
         iid = int(item_ids[i])
         label_is_purchase = int(labels[i]) == 2
-        ut, up, it, ip = state.before_update(uid, iid)
+        ut, up, it, ip, u_delay, i_delay = state.before_update(uid, iid)
         user_total[i] = ut
         user_purchase[i] = up
         item_total[i] = it
         item_purchase[i] = ip
+        user_avg_delay[i] = u_delay
+        item_avg_delay[i] = i_delay
 
         target = int(target_item_attr[i])
         if target > 0:
@@ -315,9 +415,16 @@ def _compute_raw_features(
         else:
             has_match[i] = 0
 
-        state.update(uid, iid, label_is_purchase)
+        state.update(
+            uid,
+            iid,
+            label_is_purchase,
+            timestamp=int(timestamps[i]),
+            label_time=int(label_times[i]),
+            collect_delay=enable_delay_history,
+        )
 
-    return {
+    features = {
         "user_dense_feats_110": np.log1p(user_total),
         "user_dense_feats_111": np.log1p(user_purchase),
         "item_dense_feats_86": np.log1p(item_total),
@@ -327,6 +434,10 @@ def _compute_raw_features(
         "item_dense_feats_91": np.log1p(min_match_delta),
         "item_dense_feats_92": np.log1p(match_count_7d),
     }
+    if enable_delay_history:
+        features["user_dense_feats_112"] = np.log1p(user_avg_delay)
+        features["item_dense_feats_88"] = np.log1p(item_avg_delay)
+    return features
 
 
 def iter_batches(
@@ -346,19 +457,20 @@ def fit_stats(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
+    enable_delay_history: bool = False,
 ) -> Dict[str, RunningStats]:
-    stats = {name: RunningStats() for name in [
-        "user_dense_feats_110",
-        "user_dense_feats_111",
-        "item_dense_feats_86",
-        "item_dense_feats_87",
-        "item_dense_feats_91",
-        "item_dense_feats_92",
-    ]}
+    stats = {name: RunningStats() for name in dense_feature_names(enable_delay_history)}
     state = PrefixState()
     for _, batch in iter_batches(row_groups, batch_size):
         feats = _compute_raw_features(
-            batch, state, match_col, match_ts_col, match_window_seconds, count_edges)
+            batch,
+            state,
+            match_col,
+            match_ts_col,
+            match_window_seconds,
+            count_edges,
+            enable_delay_history,
+        )
         for name, tracker in stats.items():
             tracker.update_many(feats[name])
     return stats
@@ -385,22 +497,23 @@ def write_augmented_parquet(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
-) -> None:
+    enable_delay_history: bool = False,
+) -> Dict[str, Any]:
     state = PrefixState()
     writers: Dict[str, pq.ParquetWriter] = {}
     try:
         for input_path, batch in iter_batches(row_groups, batch_size):
             feats = _compute_raw_features(
-                batch, state, match_col, match_ts_col, match_window_seconds, count_edges)
+                batch,
+                state,
+                match_col,
+                match_ts_col,
+                match_window_seconds,
+                count_edges,
+                enable_delay_history,
+            )
             table = pa.Table.from_batches([batch])
-            for name in [
-                "user_dense_feats_110",
-                "user_dense_feats_111",
-                "item_dense_feats_86",
-                "item_dense_feats_87",
-                "item_dense_feats_91",
-                "item_dense_feats_92",
-            ]:
+            for name in dense_feature_names(enable_delay_history):
                 table = _append_or_replace_column(
                     table,
                     name,
@@ -419,6 +532,7 @@ def write_augmented_parquet(
     finally:
         for writer in writers.values():
             writer.close()
+    return state.delay_quality() if enable_delay_history else {}
 
 
 def parse_edges(raw: str) -> List[int]:
@@ -435,74 +549,97 @@ def build_alignment(
     match_ts_col: str,
     count_edges: Sequence[int],
     match_window_days: int,
+    enable_delay_history: bool = False,
 ) -> Dict[str, Any]:
+    mappings: List[Dict[str, Any]] = [
+        {
+            "docx_ref": "P005",
+            "docx_text": "user_dense_feats_110 = log(1 + user_total_frequency)",
+            "implementation": "Prefix user total count before current timestamp, log1p then train-row-group z-score.",
+            "output_column": "user_dense_feats_110",
+        },
+        {
+            "docx_ref": "P009",
+            "docx_text": "user_dense_feats_111 = log(1 + user_purchase_frequency)",
+            "implementation": "Prefix user purchase count where historical label_type == 2, log1p then train-row-group z-score.",
+            "output_column": "user_dense_feats_111",
+        },
+        {
+            "docx_ref": "P007",
+            "docx_text": "item_dense_feats_86 = log(1 + item_total_frequency)",
+            "implementation": "Prefix item total count before current timestamp, log1p then train-row-group z-score.",
+            "output_column": "item_dense_feats_86",
+        },
+        {
+            "docx_ref": "P011",
+            "docx_text": "item_dense_feats_87 = log(1 + item_purchase_frequency)",
+            "implementation": "Prefix item purchase count where historical label_type == 2, log1p then train-row-group z-score.",
+            "output_column": "item_dense_feats_87",
+        },
+        {
+            "docx_ref": "P017",
+            "docx_text": "Item_int_feats_89 = has_match(item_int_feats_9, domain_d_seq_19)",
+            "implementation": "0=missing target, 1=no match, 2=has match.",
+            "output_column": "item_int_feats_89",
+            "match_column": match_col,
+        },
+        {
+            "docx_ref": "P018",
+            "docx_text": "Item_int_feats_90 = match_count(item_int_feats_9, domain_d_seq_19)",
+            "implementation": "Bucketized match_count for Embedding compatibility; raw continuous count is not used as an id.",
+            "output_column": "item_int_feats_90",
+            "bucket_edges": list(map(int, count_edges)),
+        },
+        {
+            "docx_ref": "P019",
+            "docx_text": "item_dense_feats_91 = log(1 + min_match_delta)",
+            "implementation": "Minimum timestamp - matched domain_d event timestamp, log1p then train-row-group z-score.",
+            "output_column": "item_dense_feats_91",
+            "timestamp_column": match_ts_col,
+        },
+        {
+            "docx_ref": "P020",
+            "docx_text": "item_dense_feats_92 = log(1 + match_count_7d)",
+            "implementation": "Count matches whose timestamp delta is within the configured day window, log1p then train-row-group z-score.",
+            "output_column": "item_dense_feats_92",
+            "match_window_days": int(match_window_days),
+        },
+    ]
+
+    if enable_delay_history:
+        mappings.extend([
+            {
+                "docx_ref": "P013-P014",
+                "docx_text": "delay= timestamp-label_time; user_dense_feats_112 = log(1 + user_avg_delay)",
+                "implementation": "Prefix user average delay from previously seen conversion rows only. Uses timestamp - label_time, clips negative delays to zero, then log1p and train-row-group z-score.",
+                "output_column": "user_dense_feats_112",
+            },
+            {
+                "docx_ref": "P013-P015",
+                "docx_text": "delay= timestamp-label_time; item_dense_feats_88 = log(1 + item_avg_delay)",
+                "implementation": "Prefix item average delay from previously seen conversion rows only. Uses timestamp - label_time, clips negative delays to zero, then log1p and train-row-group z-score.",
+                "output_column": "item_dense_feats_88",
+            },
+        ])
+
+    not_included = [
+        "delay-aware weighted loss",
+        "multi-task learning",
+    ]
+    if not enable_delay_history:
+        not_included.insert(0, "user_dense_feats_112 / item_dense_feats_88 avg delay")
+
     return {
         "source_docx": "/Users/gaogang/Downloads/feature-engineering.docx",
-        "experiment": "FE-01",
-        "not_included": [
-            "user_dense_feats_112 / item_dense_feats_88 avg delay",
-            "delay-aware weighted loss",
-            "multi-task learning",
-        ],
-        "mappings": [
-            {
-                "docx_ref": "P008",
-                "docx_text": "user_dense_feats_110 = log(1+user_total_frequency)",
-                "implementation": "Prefix user total count before current timestamp, log1p then train-row-group z-score.",
-                "output_column": "user_dense_feats_110",
-            },
-            {
-                "docx_ref": "P012",
-                "docx_text": "user_dense_feats_111 = log(1+user_purchase_frequency)",
-                "implementation": "Prefix user purchase count where historical label_type == 2, log1p then train-row-group z-score.",
-                "output_column": "user_dense_feats_111",
-            },
-            {
-                "docx_ref": "P010",
-                "docx_text": "item_dense_feats_86 = log(1+item_total_frequency)",
-                "implementation": "Prefix item total count before current timestamp, log1p then train-row-group z-score.",
-                "output_column": "item_dense_feats_86",
-            },
-            {
-                "docx_ref": "P014",
-                "docx_text": "item_dense_feats_87 = log(1+item_purchase_frequency)",
-                "implementation": "Prefix item purchase count where historical label_type == 2, log1p then train-row-group z-score.",
-                "output_column": "item_dense_feats_87",
-            },
-            {
-                "docx_ref": "P020",
-                "docx_text": "Item_int_feats_89 = has_match(item_int_feats_9, domain_d_seq_19)",
-                "implementation": "0=missing target, 1=no match, 2=has match.",
-                "output_column": "item_int_feats_89",
-                "match_column": match_col,
-            },
-            {
-                "docx_ref": "P021",
-                "docx_text": "Item_int_feats_90 = match_count(item_int_feats_9, domain_d_seq_19)",
-                "implementation": "Bucketized match_count for Embedding compatibility; raw continuous count is not used as an id.",
-                "output_column": "item_int_feats_90",
-                "bucket_edges": list(map(int, count_edges)),
-            },
-            {
-                "docx_ref": "P022",
-                "docx_text": "item_dense_feats_91 = log(1+min_match_delta)",
-                "implementation": "Minimum timestamp - matched domain_d event timestamp, log1p then train-row-group z-score.",
-                "output_column": "item_dense_feats_91",
-                "timestamp_column": match_ts_col,
-            },
-            {
-                "docx_ref": "P023",
-                "docx_text": "item_dense_feats_92 = log(1+match_count_7d)",
-                "implementation": "Count matches whose timestamp delta is within the configured day window, log1p then train-row-group z-score.",
-                "output_column": "item_dense_feats_92",
-                "match_window_days": int(match_window_days),
-            },
-        ],
+        "experiment": "FE-02" if enable_delay_history else "FE-01",
+        "base_experiment": "FE-01" if enable_delay_history else None,
+        "not_included": not_included,
+        "mappings": mappings,
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build FE-01 augmented parquet dataset")
+    ap = argparse.ArgumentParser(description="Build FE-01/FE-02 augmented parquet dataset")
     ap.add_argument("--input_dir", required=True)
     ap.add_argument("--input_schema", required=True)
     ap.add_argument("--output_dir", required=True)
@@ -515,6 +652,11 @@ def main() -> None:
         default=0.9,
         help="Fraction of leading row groups used to fit dense normalization stats. "
              "Default 0.9 matches train.py's default tail-10%% validation split.",
+    )
+    ap.add_argument(
+        "--enable_delay_history",
+        action="store_true",
+        help="Enable FE-02 historical avg-delay dense features 112 and 88.",
     )
     args = ap.parse_args()
 
@@ -534,27 +676,44 @@ def main() -> None:
     print(f"Input parquet files: {len(files)}")
     print(f"Input row groups: {len(row_groups)}; fitting stats on first {len(fit_row_groups)}")
     print(f"Resolved FE-01 match columns: {match_col}, {match_ts_col}")
-    print("Fitting FE-01 dense normalization stats...")
+    print(f"Delay history enabled: {args.enable_delay_history}")
+    print("Fitting feature-engineering dense normalization stats...")
     stats = fit_stats(
-        fit_row_groups, args.batch_size, match_col, match_ts_col, match_window_seconds, count_edges)
+        fit_row_groups,
+        args.batch_size,
+        match_col,
+        match_ts_col,
+        match_window_seconds,
+        count_edges,
+        args.enable_delay_history,
+    )
 
     print("Writing augmented parquet files...")
-    write_augmented_parquet(
+    delay_quality = write_augmented_parquet(
         row_groups, args.output_dir, args.batch_size, stats,
-        match_col, match_ts_col, match_window_seconds, count_edges)
+        match_col, match_ts_col, match_window_seconds, count_edges,
+        args.enable_delay_history,
+    )
 
-    augmented_schema = build_augmented_schema(schema, match_count_vocab_size=len(count_edges) + 1)
+    augmented_schema = build_augmented_schema(
+        schema,
+        match_count_vocab_size=len(count_edges) + 1,
+        enable_delay_history=args.enable_delay_history,
+    )
     output_ns_groups = filter_ns_groups(build_ns_groups(), augmented_schema)
     _write_json(os.path.join(args.output_dir, "schema.json"), augmented_schema)
     _write_json(os.path.join(args.output_dir, "ns_groups.feature_engineering.json"), output_ns_groups)
     _write_json(
         os.path.join(args.output_dir, "feature_engineering_stats.json"),
         {
+            "experiment": "FE-02" if args.enable_delay_history else "FE-01",
+            "enable_delay_history": args.enable_delay_history,
             "dense_stats": {k: v.to_dict() for k, v in stats.items()},
             "match_col": match_col,
             "match_ts_col": match_ts_col,
             "match_window_days": args.match_window_days,
             "match_count_buckets": count_edges,
+            "delay_quality": delay_quality,
             "fit_stats_row_group_ratio": args.fit_stats_row_group_ratio,
             "fit_stats_row_groups": len(fit_row_groups),
             "total_row_groups": len(row_groups),
@@ -563,9 +722,15 @@ def main() -> None:
     )
     _write_json(
         os.path.join(args.output_dir, "docx_alignment.fe01.json"),
-        build_alignment(match_col, match_ts_col, count_edges, args.match_window_days),
+        build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, False),
     )
-    print(f"Wrote FE-01 dataset to: {args.output_dir}")
+    if args.enable_delay_history:
+        _write_json(
+            os.path.join(args.output_dir, "docx_alignment.fe02.json"),
+            build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, True),
+        )
+    experiment_name = "FE-02" if args.enable_delay_history else "FE-01"
+    print(f"Wrote {experiment_name} dataset to: {args.output_dir}")
 
 
 if __name__ == "__main__":

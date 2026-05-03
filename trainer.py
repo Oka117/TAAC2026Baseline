@@ -140,7 +140,7 @@ class PCVRHyFormerRankingTrainer:
         - FE experiment transform-state files when they exist next to
           ``schema.json``. FE-00 exact evaluation needs
           ``int_fill_values.json`` and ``dense_normalization_stats.json``;
-          FE-01 exact evaluation needs ``feature_engineering_stats.json``.
+          FE-01/FE-02 exact evaluation needs ``feature_engineering_stats.json``.
         - ``train_config.json`` (serialized from ``self.train_config``):
           full set of training-time hyperparameters. When ``ns_groups.json``
           is copied into ``ckpt_dir``, the ``ns_groups_json`` field is
@@ -165,6 +165,7 @@ class PCVRHyFormerRankingTrainer:
                 # same checkpoint packaging path.
                 'feature_engineering_stats.json',
                 'docx_alignment.fe01.json',
+                'docx_alignment.fe02.json',
             ):
                 sidecar_path = os.path.join(schema_dir, sidecar_name)
                 if os.path.exists(sidecar_path):
