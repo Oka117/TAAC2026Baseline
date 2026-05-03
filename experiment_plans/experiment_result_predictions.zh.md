@@ -6,9 +6,9 @@
 
 | 实验 | 主变量 | 代码改动 | 推荐参数 | AUC 预测 |
 | --- | --- | --- | --- | --- |
-| B0 | 当前 baseline | 无 | `run.sh` active config | 基准 |
-| FE-00 | 缺失处理 + dense normalization | 扩展 FE 脚本 | `missing_ratio_threshold=0.75` | `-0.0002 ~ +0.0006` |
-| FE-01 | prefix frequency + target match + item dense token | `tools/build_feature_engineering_dataset.py`, `dataset.py item_dense` | `user_ns_tokens=6,item_ns_tokens=4,num_queries=1,d_model=64` | `+0.0010 ~ +0.0030` |
+| B0 | 当前 baseline | 无 | 直接 `python3 -u train.py` 跑原始数据与 baseline active config | 基准 |
+| FE-00 | 缺失处理 + dense normalization | `build_fe00_preprocess_dataset.py` | `missing_threshold=0.75,fit_stats_row_group_ratio=0.9` | `-0.0002 ~ +0.0006` |
+| FE-01 | prefix frequency + target match + item dense token | `build_feature_engineering_dataset.py`, `dataset.py item_dense` | `user_ns_tokens=6,item_ns_tokens=4,num_queries=1,d_model=64` | `+0.0010 ~ +0.0030` |
 | FE-02 | 历史 avg delay dense | 扩展 FE 脚本 | 沿用 FE-01 | `+0.0002 ~ +0.0010` |
 | FE-03 | delay-aware weighted BCE | `trainer.py`, `train.py`, `dataset.py` | `fast_boost alpha=0.3 clip=3.0` | `-0.0003 ~ +0.0008` |
 | FE-04 | conversion + delay bucket + engagement multi-task | `model.py`, `trainer.py`, `train.py`, `dataset.py` | `delay_loss_weight=0.05, engagement_loss_weight=0.02` | `+0.0003 ~ +0.0015` |

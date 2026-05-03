@@ -16,14 +16,20 @@
 
 使用当前仓库默认训练方式，不使用新增离线特征，不使用新的 NS 分组。
 
-说明：当前 `run.sh` 会自动注入 `--ns_tokenizer_type rankmixer --user_ns_tokens 5 --item_ns_tokens 2 --num_queries 2 --ns_groups_json ""`，这就是现有 baseline 的 active config。B0 不额外传新的 NS groups。
+说明：当前平台 `run.sh` 已更新为 FE-00 入口；若要跑“未做 FE-00 预处理、未做 FE-01 特征”的纯 B0 对照，应直接调用 `train.py`，并显式传入 baseline active config。B0 不额外传新的 NS groups。
 
 推荐参数：
 
 ```bash
-bash run.sh \
+python3 -u train.py \
   --data_dir /path/to/original_dataset \
   --schema_path /path/to/original_dataset/schema.json \
+  --ns_groups_json "" \
+  --ns_tokenizer_type rankmixer \
+  --user_ns_tokens 5 \
+  --item_ns_tokens 2 \
+  --num_queries 2 \
+  --rank_mixer_mode full \
   --ckpt_dir outputs/exp_b0_baseline/ckpt \
   --log_dir outputs/exp_b0_baseline/log \
   --batch_size 256 \
@@ -78,7 +84,7 @@ multi-task loss
 离线预处理脚本建议命名为：
 
 ```text
-tools/build_feature_engineering_dataset.py
+build_feature_engineering_dataset.py
 ```
 
 当前仓库已提供该脚本。它会输出增强 parquet、增强 `schema.json`、`ns_groups.feature_engineering.json` 和 `feature_engineering_stats.json`。
@@ -86,7 +92,7 @@ tools/build_feature_engineering_dataset.py
 输入：
 
 ```bash
-python3 tools/build_feature_engineering_dataset.py \
+python3 build_feature_engineering_dataset.py \
   --input_dir /path/to/original_dataset \
   --input_schema /path/to/original_dataset/schema.json \
   --output_dir /path/to/fe01_dataset \
@@ -240,7 +246,7 @@ d_model = 64, 64 % 16 == 0
 
 FE-01 至少需要两处代码修改：
 
-1. 新增 `tools/build_feature_engineering_dataset.py`。
+1. 新增 `build_feature_engineering_dataset.py`。
 2. 修改 `dataset.py`，支持从 schema 读取 `item_dense` 并返回非空 `item_dense_feats`。
 
 `model.py` 第一轮不需要改，因为当前已经有：

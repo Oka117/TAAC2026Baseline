@@ -27,7 +27,7 @@ item_int_feats_88_has_delay_history
 基于 FE-01 数据增强脚本扩展：
 
 ```bash
-python3 tools/build_feature_engineering_dataset.py \
+python3 build_feature_engineering_dataset.py \
   --input_dir /path/to/original_dataset \
   --input_schema /path/to/original_dataset/schema.json \
   --output_dir /path/to/fe02_dataset \

@@ -94,7 +94,7 @@ DOCX 中的 `delay = timestamp - label_time` 和 `avg_delay` 需要谨慎：
 
 ### 4.1 新增离线预处理脚本
 
-新增 `tools/build_feature_engineering_dataset.py`，输入原始 parquet 目录和原始 `schema.json`，输出增强后的 parquet 目录、增强后的 `schema.json` 和一份新的 `ns_groups.feature_engineering.json`。
+新增 `build_feature_engineering_dataset.py`，输入原始 parquet 目录和原始 `schema.json`，输出增强后的 parquet 目录、增强后的 `schema.json` 和一份新的 `ns_groups.feature_engineering.json`。
 
 预处理脚本建议完成：
 
@@ -268,7 +268,7 @@ engagement label 需要先确认官方字段语义；若只能使用 proxy label
 
 | 文件 | 修改方向 | 优先级 |
 | --- | --- | --- |
-| `tools/build_feature_engineering_dataset.py` | 新增离线特征生成、normalization stats、增强 schema 和 NS groups | P0 |
+| `build_feature_engineering_dataset.py` | 新增离线特征生成、normalization stats、增强 schema 和 NS groups | P0 |
 | `dataset.py` | 支持 `item_dense` schema 与读取；可选返回 train-only delay label/weight | P0 |
 | `ns_groups.feature_engineering.json` | 新增一份实验分组，不覆盖示例 `ns_groups.json` | P0 |
 | `train.py` | 增加 feature-engineering 配置、delay loss 参数、校验 NS token 数与 `d_model` | P1 |
