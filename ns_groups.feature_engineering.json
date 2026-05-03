@@ -1,0 +1,19 @@
+{
+  "_purpose": "FE-01 NS groups. Dense feature ids are intentionally omitted; they enter through user/item dense tokens.",
+  "_note": "Use with --ns_tokenizer_type rankmixer --user_ns_tokens 6 --item_ns_tokens 4 --num_queries 1 when item_dense is enabled.",
+  "user_ns_groups": {
+    "U1_user_profile": [1, 15, 48, 49],
+    "U2_user_behavior_stats": [50, 60],
+    "U3_user_context": [51, 52, 53, 54, 55, 56, 57, 58, 59],
+    "U4_user_temporal_behavior": [62, 63, 64, 65, 66],
+    "U5_user_interest_ids": [80, 82, 86],
+    "U6_user_long_tail_sparse": [89, 90, 91, 92, 93],
+    "U7_user_high_cardinality": [94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+  },
+  "item_ns_groups": {
+    "I1_item_identity": [5, 6, 7, 8],
+    "I2_item_category_brand": [9, 10, 11, 12, 13],
+    "I3_item_semantic_sparse": [16, 81, 83, 84, 85],
+    "I4_target_matching_fields": [89, 90]
+  }
+}

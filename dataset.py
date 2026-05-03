@@ -218,6 +218,7 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
+        self._buf_item_dense = np.zeros((B, self.item_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_lens = {}
@@ -248,6 +249,13 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
             self._user_dense_plan.append((ci, dim, offset))
+            offset += dim
+
+        self._item_dense_plan = []
+        offset = 0
+        for fid, dim in self._item_dense_cols:
+            ci = self._col_idx.get(f'item_dense_feats_{fid}')
+            self._item_dense_plan.append((ci, dim, offset))
             offset += dim
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
@@ -296,8 +304,12 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
 
-        # ---- item_dense (empty) ----
+        # ---- item_dense: [[fid, dim], ...] (optional; absent in the original
+        # baseline schema, enabled by feature-engineering datasets) ----
+        self._item_dense_cols: List[List[int]] = raw.get('item_dense', [])
         self.item_dense_schema: FeatureSchema = FeatureSchema()
+        for fid, dim in self._item_dense_cols:
+            self.item_dense_schema.add(fid, dim)
 
         # ---- sequence domains ----
         self._seq_cfg: Dict[str, Dict[str, Any]] = raw['seq']
@@ -482,11 +494,18 @@ class PCVRParquetDataset(IterableDataset):
 
     def _pad_varlen_float_column(
         self,
-        arrow_col: "pa.ListArray",
+        arrow_col: "pa.Array",
         max_dim: int,
         B: int,
     ) -> "npt.NDArray[np.float32]":
-        """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
+        """Pad an Arrow float scalar/list column to shape ``[B, max_dim]``."""
+        if not pa.types.is_list(arrow_col.type):
+            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32)
+            padded = np.zeros((B, max_dim), dtype=np.float32)
+            if max_dim > 0:
+                padded[:, 0] = arr
+            return padded
+
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
 
@@ -570,11 +589,19 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- item_dense ----
+        item_dense = self._buf_item_dense[:B]
+        item_dense[:] = 0
+        for ci, dim, offset in self._item_dense_plan:
+            col = batch.column(ci)
+            padded = self._pad_varlen_float_column(col, dim, B)
+            item_dense[:, offset:offset + dim] = padded
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
-            'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
+            'item_dense_feats': torch.from_numpy(item_dense.copy()),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
