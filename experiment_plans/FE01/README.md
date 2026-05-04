@@ -5,10 +5,10 @@
 FE-01 只验证 DOCX 中第一组低泄漏风险特征，不加入 delay loss 或 multi-task：
 
 ```text
-P008/P012: user prefix frequency dense
-P010/P014: item prefix frequency dense
-P020/P021: item_int_feats_9 与 domain_d_seq_19 的 match 特征
-P022/P023: min_match_delta 与 match_count_7d dense
+P005/P009: user prefix frequency dense
+P007/P011: item prefix frequency dense
+P017/P018: item_int_feats_9 与 domain_d_seq_19 的 match 特征
+P019/P020: min_match_delta 与 match_count_7d dense
 ```
 
 ## 代码文件
@@ -20,6 +20,7 @@ P022/P023: min_match_delta 与 match_count_7d dense
 | `ns_groups.feature_engineering.json` | FE-01 推荐 int-only NS groups |
 | `dataset.py` | 读取 `item_dense`，让新增 item dense token 进入模型 |
 | `trainer.py` | 保存 checkpoint 时打包 FE-01 stats sidecar，供严格评估复用 |
+| `evaluation/FE01/infer.py` | 评估时把 raw eval parquet 转成 FE-01 增强 parquet，再按 checkpoint schema 推理 |
 
 ## 文档文件
 
@@ -55,6 +56,7 @@ run_fe01.sh -> build_feature_engineering_dataset.py -> FE01_ROOT/schema.json
 run_fe01.sh -> FE01_ROOT/ns_groups.feature_engineering.json -> train.py
 dataset.py -> item_dense_feats -> model.py item_dense_proj
 trainer.py -> checkpoint/feature_engineering_stats.json
+evaluation/FE01/infer.py -> feature_engineering_stats.json -> FE01 eval parquet
 ```
 
 重新训练后的 best checkpoint 应包含：

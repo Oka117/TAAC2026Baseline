@@ -20,8 +20,14 @@ Environment variables:
 import os
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+import glob
+import tempfile
+from collections import defaultdict
+from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -78,6 +84,358 @@ _FALLBACK_NUM_WORKERS = 16
 # Hyperparameter keys used to build the model. Everything else in
 # ``train_config.json`` is ignored when constructing ``PCVRHyFormer``.
 _MODEL_CFG_KEYS = list(_FALLBACK_MODEL_CFG.keys())
+
+FE01_USER_DENSE_COLUMNS = [
+    "user_dense_feats_110",
+    "user_dense_feats_111",
+]
+FE01_ITEM_DENSE_COLUMNS = [
+    "item_dense_feats_86",
+    "item_dense_feats_87",
+    "item_dense_feats_91",
+    "item_dense_feats_92",
+]
+FE01_ITEM_INT_COLUMNS = [
+    "item_int_feats_89",
+    "item_int_feats_90",
+]
+FE01_ALL_COLUMNS = FE01_USER_DENSE_COLUMNS + FE01_ITEM_DENSE_COLUMNS + FE01_ITEM_INT_COLUMNS
+
+
+class PrefixState:
+    def __init__(self) -> None:
+        self.user_total: DefaultDict[int, int] = defaultdict(int)
+        self.user_purchase: DefaultDict[int, int] = defaultdict(int)
+        self.item_total: DefaultDict[int, int] = defaultdict(int)
+        self.item_purchase: DefaultDict[int, int] = defaultdict(int)
+
+    def before_update(self, user_id: int, item_id: int) -> Tuple[int, int, int, int]:
+        return (
+            self.user_total[user_id],
+            self.user_purchase[user_id],
+            self.item_total[item_id],
+            self.item_purchase[item_id],
+        )
+
+    def update(self, user_id: int, item_id: int, is_purchase: bool) -> None:
+        self.user_total[user_id] += 1
+        self.item_total[item_id] += 1
+        if is_purchase:
+            self.user_purchase[user_id] += 1
+            self.item_purchase[item_id] += 1
+
+
+def _load_json(path: str) -> Any:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def _resolve_fe01_sidecar(model_dir: str, filename: str) -> Optional[str]:
+    local_path = os.path.join(model_dir, filename)
+    if os.path.exists(local_path):
+        return local_path
+
+    stats_dir = os.environ.get('FE01_STATS_DIR') or os.environ.get('FE01_STATS_PATH')
+    if stats_dir:
+        candidate = os.path.join(stats_dir, filename)
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def _load_fe01_stats(model_dir: str) -> Dict[str, Any]:
+    stats_path = _resolve_fe01_sidecar(model_dir, 'feature_engineering_stats.json')
+    if stats_path is None:
+        raise FileNotFoundError(
+            "Missing FE-01 sidecar: feature_engineering_stats.json. "
+            "Put it next to model.pt in MODEL_OUTPUT_PATH, or set FE01_STATS_DIR "
+            "to the FE-01 preprocessing output directory. Evaluation must reuse "
+            "training dense normalization stats and must not re-fit on eval data."
+        )
+    logging.info(f"Using FE-01 feature stats: {stats_path}")
+    return _load_json(stats_path)
+
+
+def _parquet_files(input_dir: str) -> List[str]:
+    files = sorted(glob.glob(os.path.join(input_dir, '*.parquet')))
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {input_dir}")
+    return files
+
+
+def _iter_batches(files: Sequence[str], batch_size: int) -> Iterable[Tuple[str, pa.RecordBatch]]:
+    for path in files:
+        pf = pq.ParquetFile(path)
+        for rg_idx in range(pf.metadata.num_row_groups):
+            for batch in pf.iter_batches(batch_size=batch_size, row_groups=[rg_idx]):
+                yield path, batch
+
+
+def _strip_prefix(prefix: str) -> str:
+    return prefix[:-1] if prefix.endswith('_') else prefix
+
+
+def _resolve_domain_d_columns(
+    schema: Dict[str, Any],
+    parquet_names: Sequence[str],
+    stats: Dict[str, Any],
+) -> Tuple[str, str]:
+    names = set(parquet_names)
+    stats_match_col = stats.get('match_col')
+    stats_ts_col = stats.get('match_ts_col')
+    if stats_match_col in names and stats_ts_col in names:
+        return str(stats_match_col), str(stats_ts_col)
+
+    candidates: List[Tuple[str, Optional[int]]] = []
+    for domain, cfg in schema.get('seq', {}).items():
+        prefix = _strip_prefix(str(cfg.get('prefix', '')))
+        if domain in {'domain_d', 'seq_d'} or prefix == 'domain_d_seq':
+            candidates.append((prefix, cfg.get('ts_fid')))
+    candidates.append(('domain_d_seq', 26))
+
+    for prefix, ts_fid in candidates:
+        match_col = f'{prefix}_19'
+        ts_col = f'{prefix}_{ts_fid}' if ts_fid is not None else f'{prefix}_26'
+        if match_col in names and ts_col in names:
+            return match_col, ts_col
+
+    raise KeyError(
+        "Could not resolve FE-01 domain_d columns in eval parquet. Expected "
+        "domain_d_seq_19 and a timestamp column such as domain_d_seq_26."
+    )
+
+
+def _to_int_array(arr: pa.Array) -> np.ndarray:
+    return arr.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
+
+
+def _first_scalar_from_maybe_list(values: Iterable[Any]) -> np.ndarray:
+    out: List[int] = []
+    for value in values:
+        if value is None:
+            out.append(0)
+        elif isinstance(value, list):
+            first = 0
+            for x in value:
+                if x is not None and int(x) > 0:
+                    first = int(x)
+                    break
+            out.append(first)
+        else:
+            out.append(int(value))
+    return np.asarray(out, dtype=np.int64)
+
+
+def _list_values(arr: pa.Array) -> List[List[int]]:
+    values = arr.to_pylist()
+    return [[] if v is None else [int(x) for x in v if x is not None] for v in values]
+
+
+def _bucketize_counts(counts: np.ndarray, edges: Sequence[int]) -> np.ndarray:
+    upper_edges = np.asarray(list(edges)[1:], dtype=np.int64)
+    return (np.searchsorted(upper_edges, counts, side='right') + 1).astype(np.int64)
+
+
+def _compute_raw_fe01_features(
+    batch: pa.RecordBatch,
+    state: PrefixState,
+    match_col: str,
+    match_ts_col: str,
+    match_window_seconds: int,
+    count_edges: Sequence[int],
+) -> Dict[str, np.ndarray]:
+    names = batch.schema.names
+    idx = {name: i for i, name in enumerate(names)}
+    B = batch.num_rows
+
+    user_ids = _to_int_array(batch.column(idx['user_id']))
+    item_ids = _to_int_array(batch.column(idx['item_id']))
+    timestamps = _to_int_array(batch.column(idx['timestamp']))
+    # Never consume eval labels when constructing online features. Official
+    # eval data may omit label_type, or may contain placeholder/private values;
+    # purchase-prefix state is therefore kept at zero to avoid leakage.
+    labels = np.zeros(B, dtype=np.int64)
+
+    if 'item_int_feats_9' not in idx:
+        raise KeyError("FE-01 evaluation requires item_int_feats_9 in eval parquet")
+
+    target_item_attr = _first_scalar_from_maybe_list(batch.column(idx['item_int_feats_9']).to_pylist())
+    seq_values = _list_values(batch.column(idx[match_col]))
+    seq_times = _list_values(batch.column(idx[match_ts_col]))
+
+    user_total = np.zeros(B, dtype=np.float32)
+    user_purchase = np.zeros(B, dtype=np.float32)
+    item_total = np.zeros(B, dtype=np.float32)
+    item_purchase = np.zeros(B, dtype=np.float32)
+    has_match = np.zeros(B, dtype=np.int64)
+    match_count = np.zeros(B, dtype=np.int64)
+    min_match_delta = np.zeros(B, dtype=np.float32)
+    match_count_7d = np.zeros(B, dtype=np.float32)
+
+    row_order = np.argsort(timestamps, kind='stable')
+    for i in row_order:
+        uid = int(user_ids[i])
+        iid = int(item_ids[i])
+        is_purchase = int(labels[i]) == 2
+        ut, up, it, ip = state.before_update(uid, iid)
+        user_total[i] = ut
+        user_purchase[i] = up
+        item_total[i] = it
+        item_purchase[i] = ip
+
+        target = int(target_item_attr[i])
+        if target > 0:
+            deltas: List[int] = []
+            count_7d = 0
+            for value, event_time in zip(seq_values[i], seq_times[i]):
+                if value != target:
+                    continue
+                match_count[i] += 1
+                if event_time > 0:
+                    delta = max(int(timestamps[i]) - int(event_time), 0)
+                    deltas.append(delta)
+                    if delta <= match_window_seconds:
+                        count_7d += 1
+            has_match[i] = 2 if match_count[i] > 0 else 1
+            min_match_delta[i] = min(deltas) if deltas else 0.0
+            match_count_7d[i] = count_7d
+        else:
+            has_match[i] = 0
+
+        state.update(uid, iid, is_purchase)
+
+    return {
+        'user_dense_feats_110': np.log1p(user_total),
+        'user_dense_feats_111': np.log1p(user_purchase),
+        'item_dense_feats_86': np.log1p(item_total),
+        'item_dense_feats_87': np.log1p(item_purchase),
+        'item_int_feats_89': has_match,
+        'item_int_feats_90': _bucketize_counts(match_count, count_edges),
+        'item_dense_feats_91': np.log1p(min_match_delta),
+        'item_dense_feats_92': np.log1p(match_count_7d),
+    }
+
+
+def _normalize_with_training_stats(
+    name: str,
+    values: np.ndarray,
+    dense_stats: Dict[str, Dict[str, float]],
+) -> np.ndarray:
+    if name not in dense_stats:
+        raise KeyError(
+            f"feature_engineering_stats.json missing dense_stats.{name}. "
+            "Cannot normalize FE-01 eval features exactly."
+        )
+    stat = dense_stats[name]
+    mean = float(stat.get('mean', 0.0))
+    std = max(float(stat.get('std', 1.0)), 1e-6)
+    return ((values.astype(np.float32) - mean) / std).astype(np.float32)
+
+
+def _append_or_replace_column(table: pa.Table, name: str, values: pa.Array) -> pa.Table:
+    idx = table.schema.get_field_index(name)
+    if idx == -1:
+        return table.append_column(name, values)
+    return table.set_column(idx, name, values)
+
+
+def _expected_fe01_columns_from_schema(schema_path: str) -> List[str]:
+    schema = _load_json(schema_path)
+    expected: List[str] = []
+    user_dense_fids = {int(row[0]) for row in schema.get('user_dense', [])}
+    item_dense_fids = {int(row[0]) for row in schema.get('item_dense', [])}
+    item_int_fids = {int(row[0]) for row in schema.get('item_int', [])}
+    for name in FE01_USER_DENSE_COLUMNS:
+        if int(name.rsplit('_', 1)[1]) in user_dense_fids:
+            expected.append(name)
+    for name in FE01_ITEM_DENSE_COLUMNS:
+        if int(name.rsplit('_', 1)[1]) in item_dense_fids:
+            expected.append(name)
+    for name in FE01_ITEM_INT_COLUMNS:
+        if int(name.rsplit('_', 1)[1]) in item_int_fids:
+            expected.append(name)
+    return expected
+
+
+def maybe_build_fe01_eval_dataset(
+    data_dir: str,
+    schema_path: str,
+    model_dir: str,
+    batch_size: int,
+    result_dir: str,
+) -> str:
+    """Materialize FE-01 columns for raw eval parquet when checkpoint schema expects them."""
+    files = _parquet_files(data_dir)
+    first_names = pq.ParquetFile(files[0]).schema_arrow.names
+    expected = _expected_fe01_columns_from_schema(schema_path)
+    missing = [name for name in expected if name not in first_names]
+    if not missing:
+        logging.info("Eval parquet already contains FE-01 columns; using raw eval directory.")
+        return data_dir
+
+    unsupported = [name for name in missing if name not in FE01_ALL_COLUMNS]
+    if unsupported:
+        raise KeyError(
+            "Checkpoint schema expects columns that FE-01 infer.py cannot generate: "
+            + ", ".join(unsupported)
+        )
+
+    logging.info(f"Eval parquet missing FE-01 columns: {missing}")
+    stats = _load_fe01_stats(model_dir)
+    dense_stats = stats.get('dense_stats', {})
+    count_edges = [int(x) for x in stats.get('match_count_buckets', [0, 1, 2, 4, 8])]
+    match_window_days = int(stats.get('match_window_days', 7))
+    match_window_seconds = match_window_days * 86400
+    raw_schema = _load_json(schema_path)
+    match_col, match_ts_col = _resolve_domain_d_columns(raw_schema, first_names, stats)
+    if 'label_type' in first_names:
+        logging.info(
+            "Eval parquet contains label_type, but FE-01 eval transform will "
+            "ignore it to avoid label leakage.")
+    else:
+        logging.warning(
+            "Eval parquet has no label_type column; FE-01 purchase-frequency "
+            "features 111/87 will use zero online-observable purchase state.")
+
+    output_dir = os.environ.get('FE01_EVAL_DATA_DIR')
+    if not output_dir:
+        output_dir = tempfile.mkdtemp(prefix='taac_fe01_eval_')
+    os.makedirs(output_dir, exist_ok=True)
+    logging.info(f"Writing FE-01 eval parquet to: {output_dir}")
+    logging.info(f"Resolved FE-01 eval match columns: {match_col}, {match_ts_col}")
+
+    state = PrefixState()
+    writers: Dict[str, pq.ParquetWriter] = {}
+    try:
+        for input_path, batch in _iter_batches(files, batch_size):
+            feats = _compute_raw_fe01_features(
+                batch, state, match_col, match_ts_col, match_window_seconds, count_edges)
+            table = pa.Table.from_batches([batch])
+            for name in FE01_USER_DENSE_COLUMNS + FE01_ITEM_DENSE_COLUMNS:
+                table = _append_or_replace_column(
+                    table,
+                    name,
+                    pa.array(
+                        _normalize_with_training_stats(name, feats[name], dense_stats),
+                        type=pa.float32(),
+                    ),
+                )
+            for name in FE01_ITEM_INT_COLUMNS:
+                table = _append_or_replace_column(
+                    table, name, pa.array(feats[name], type=pa.int64()))
+
+            out_path = os.path.join(output_dir, os.path.basename(input_path))
+            writer = writers.get(out_path)
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema, compression='snappy')
+                writers[out_path] = writer
+            writer.write_table(table)
+    finally:
+        for writer in writers.values():
+            writer.close()
+
+    return output_dir
 
 
 def build_feature_specs(
@@ -331,6 +689,18 @@ def main() -> None:
     # ---- Data loading: reuse batch_size / num_workers from training config ----
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
+
+    # ---- FE-01 transform-only preprocessing for raw eval data ----
+    # The checkpoint schema contains FE-01 generated columns, but official eval
+    # parquet is raw. Materialize those columns before constructing the dataset
+    # so dataset.py never sees a missing column index.
+    data_dir = maybe_build_fe01_eval_dataset(
+        data_dir=data_dir,
+        schema_path=schema_path,
+        model_dir=model_dir,
+        batch_size=batch_size,
+        result_dir=result_dir,
+    )
 
     test_dataset = PCVRParquetDataset(
         parquet_path=data_dir,
