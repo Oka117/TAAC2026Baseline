@@ -398,6 +398,7 @@ def _compute_raw_features(
     match_window_seconds: int,
     count_edges: Sequence[int],
     enable_delay_history: bool = False,
+    compute_match_features: bool = True,
 ) -> Dict[str, np.ndarray]:
     names = batch.schema.names
     idx = {name: i for i, name in enumerate(names)}
@@ -414,12 +415,16 @@ def _compute_raw_features(
     else:
         label_times = np.zeros(B, dtype=np.int64)
 
-    if "item_int_feats_9" not in idx:
-        raise KeyError("FE-01 requires item_int_feats_9 in the input parquet")
-    target_item_attr = _first_scalar_from_maybe_list(batch.column(idx["item_int_feats_9"]).to_pylist())
-
-    seq_values = _list_values(batch.column(idx[match_col]))
-    seq_times = _list_values(batch.column(idx[match_ts_col]))
+    if compute_match_features:
+        if "item_int_feats_9" not in idx:
+            raise KeyError("FE-01B/FE-01 requires item_int_feats_9 in the input parquet")
+        target_item_attr = _first_scalar_from_maybe_list(batch.column(idx["item_int_feats_9"]).to_pylist())
+        seq_values = _list_values(batch.column(idx[match_col]))
+        seq_times = _list_values(batch.column(idx[match_ts_col]))
+    else:
+        target_item_attr = np.zeros(B, dtype=np.int64)
+        seq_values = [[] for _ in range(B)]
+        seq_times = [[] for _ in range(B)]
 
     user_total = np.zeros(B, dtype=np.float32)
     user_purchase = np.zeros(B, dtype=np.float32)
@@ -448,7 +453,7 @@ def _compute_raw_features(
         item_avg_delay[i] = i_delay
 
         target = int(target_item_attr[i])
-        if target > 0:
+        if compute_match_features and target > 0:
             deltas: List[int] = []
             count_7d = 0
             for value, event_time in zip(seq_values[i], seq_times[i]):
@@ -526,6 +531,7 @@ def fit_stats(
             match_window_seconds,
             count_edges,
             enable_delay_history,
+            feature_set != "fe01a",
         )
         for name, tracker in stats.items():
             tracker.update_many(feats[name])
@@ -569,6 +575,7 @@ def write_augmented_parquet(
                 match_window_seconds,
                 count_edges,
                 enable_delay_history,
+                feature_set != "fe01a",
             )
             table = pa.Table.from_batches([batch])
             for name in dense_feature_names(feature_set, enable_delay_history):
@@ -753,7 +760,10 @@ def main() -> None:
     row_groups = _parquet_row_groups(files)
     schema = _load_schema(args.input_schema)
     first_names = pq.ParquetFile(files[0]).schema_arrow.names
-    match_col, match_ts_col = resolve_domain_d_columns(schema, first_names)
+    if args.feature_set == "fe01a":
+        match_col, match_ts_col = "", ""
+    else:
+        match_col, match_ts_col = resolve_domain_d_columns(schema, first_names)
     count_edges = parse_edges(args.match_count_buckets)
     match_window_seconds = int(args.match_window_days * 86400)
     n_fit_row_groups = max(1, int(len(row_groups) * args.fit_stats_row_group_ratio))

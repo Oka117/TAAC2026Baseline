@@ -244,6 +244,7 @@ def _compute_raw_fe01_features(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
+    compute_match_features: bool = True,
 ) -> Dict[str, np.ndarray]:
     names = batch.schema.names
     idx = {name: i for i, name in enumerate(names)}
@@ -257,12 +258,16 @@ def _compute_raw_fe01_features(
     # purchase-prefix state is therefore kept at zero to avoid leakage.
     labels = np.zeros(B, dtype=np.int64)
 
-    if 'item_int_feats_9' not in idx:
-        raise KeyError("FE-01 evaluation requires item_int_feats_9 in eval parquet")
-
-    target_item_attr = _first_scalar_from_maybe_list(batch.column(idx['item_int_feats_9']).to_pylist())
-    seq_values = _list_values(batch.column(idx[match_col]))
-    seq_times = _list_values(batch.column(idx[match_ts_col]))
+    if compute_match_features:
+        if 'item_int_feats_9' not in idx:
+            raise KeyError("FE-01B/FE-01 evaluation requires item_int_feats_9 in eval parquet")
+        target_item_attr = _first_scalar_from_maybe_list(batch.column(idx['item_int_feats_9']).to_pylist())
+        seq_values = _list_values(batch.column(idx[match_col]))
+        seq_times = _list_values(batch.column(idx[match_ts_col]))
+    else:
+        target_item_attr = np.zeros(B, dtype=np.int64)
+        seq_values = [[] for _ in range(B)]
+        seq_times = [[] for _ in range(B)]
 
     user_total = np.zeros(B, dtype=np.float32)
     user_purchase = np.zeros(B, dtype=np.float32)
@@ -285,7 +290,7 @@ def _compute_raw_fe01_features(
         item_purchase[i] = ip
 
         target = int(target_item_attr[i])
-        if target > 0:
+        if compute_match_features and target > 0:
             deltas: List[int] = []
             count_7d = 0
             for value, event_time in zip(seq_values[i], seq_times[i]):
@@ -383,6 +388,9 @@ def maybe_build_fe01_eval_dataset(
     expected_user_dense = [name for name in FE01_USER_DENSE_COLUMNS if name in expected]
     expected_item_dense = [name for name in FE01_ITEM_DENSE_COLUMNS if name in expected]
     expected_item_int = [name for name in FE01_ITEM_INT_COLUMNS if name in expected]
+    needs_match_features = bool(expected_item_int or any(
+        name in expected_item_dense for name in ('item_dense_feats_91', 'item_dense_feats_92')
+    ))
 
     logging.info(f"Eval parquet missing FE-01 columns: {missing}")
     stats = _load_fe01_stats(model_dir)
@@ -390,8 +398,11 @@ def maybe_build_fe01_eval_dataset(
     count_edges = [int(x) for x in stats.get('match_count_buckets', [0, 1, 2, 4, 8])]
     match_window_days = int(stats.get('match_window_days', 7))
     match_window_seconds = match_window_days * 86400
-    raw_schema = _load_json(schema_path)
-    match_col, match_ts_col = _resolve_domain_d_columns(raw_schema, first_names, stats)
+    if needs_match_features:
+        raw_schema = _load_json(schema_path)
+        match_col, match_ts_col = _resolve_domain_d_columns(raw_schema, first_names, stats)
+    else:
+        match_col, match_ts_col = '', ''
     if 'label_type' in first_names:
         logging.info(
             "Eval parquet contains label_type, but FE-01 eval transform will "
@@ -406,14 +417,24 @@ def maybe_build_fe01_eval_dataset(
         output_dir = tempfile.mkdtemp(prefix='taac_fe01_eval_')
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"Writing FE-01 eval parquet to: {output_dir}")
-    logging.info(f"Resolved FE-01 eval match columns: {match_col}, {match_ts_col}")
+    if needs_match_features:
+        logging.info(f"Resolved FE-01 eval match columns: {match_col}, {match_ts_col}")
+    else:
+        logging.info("FE-01 eval transform does not need target-history match columns.")
 
     state = PrefixState()
     writers: Dict[str, pq.ParquetWriter] = {}
     try:
         for input_path, batch in _iter_batches(files, batch_size):
             feats = _compute_raw_fe01_features(
-                batch, state, match_col, match_ts_col, match_window_seconds, count_edges)
+                batch,
+                state,
+                match_col,
+                match_ts_col,
+                match_window_seconds,
+                count_edges,
+                needs_match_features,
+            )
             table = pa.Table.from_batches([batch])
             for name in expected_user_dense + expected_item_dense:
                 table = _append_or_replace_column(
