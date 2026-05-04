@@ -1,4 +1,4 @@
-"""Build FE-01 / FE-02 feature-engineering parquet datasets.
+"""Build FE-01 / FE-01A / FE-01B / FE-02 feature-engineering parquet datasets.
 
 This script implements the FE-01 plan in
 ``experiment_plans/FE01/experiment_01_feature_engineering_plan.zh.md`` and,
@@ -62,6 +62,12 @@ DELAY_DENSE_FEATURE_NAMES = [
     "user_dense_feats_112",
     "item_dense_feats_88",
 ]
+
+FEATURE_SET_TO_EXPERIMENT = {
+    "fe01": "FE-01",
+    "fe01a": "FE-01A",
+    "fe01b": "FE-01B",
+}
 
 
 @dataclass
@@ -204,30 +210,75 @@ def _append_feature_specs(
     return [by_fid[fid] for fid in sorted(by_fid)]
 
 
-def dense_feature_names(enable_delay_history: bool) -> List[str]:
-    names = list(BASE_DENSE_FEATURE_NAMES)
+def normalize_feature_set(feature_set: str) -> str:
+    normalized = feature_set.strip().lower()
+    if normalized not in FEATURE_SET_TO_EXPERIMENT:
+        raise ValueError(
+            "--feature_set must be one of: "
+            + ", ".join(sorted(FEATURE_SET_TO_EXPERIMENT))
+        )
+    return normalized
+
+
+def selected_user_dense_adds(feature_set: str, enable_delay_history: bool) -> List[Tuple[int, int]]:
+    if feature_set == "fe01a":
+        adds: List[Tuple[int, int]] = [(110, 1)]
+    elif feature_set == "fe01b":
+        adds = []
+    else:
+        adds = list(USER_DENSE_ADDS)
+    if enable_delay_history:
+        adds.extend(USER_DELAY_DENSE_ADDS)
+    return adds
+
+
+def selected_item_dense_adds(feature_set: str, enable_delay_history: bool) -> List[Tuple[int, int]]:
+    if feature_set == "fe01a":
+        adds: List[Tuple[int, int]] = [(86, 1)]
+    elif feature_set == "fe01b":
+        adds = [(91, 1), (92, 1)]
+    else:
+        adds = list(ITEM_DENSE_ADDS)
+    if enable_delay_history:
+        adds.extend(ITEM_DELAY_DENSE_ADDS)
+    return adds
+
+
+def selected_item_int_adds(feature_set: str, match_count_vocab_size: int) -> List[Tuple[int, int, int]]:
+    if feature_set == "fe01a":
+        return []
+    return [*ITEM_INT_BASE_ADDS, (90, match_count_vocab_size, 1)]
+
+
+def dense_feature_names(feature_set: str, enable_delay_history: bool) -> List[str]:
+    user_names = [f"user_dense_feats_{fid}" for fid, _ in selected_user_dense_adds(feature_set, False)]
+    item_names = [f"item_dense_feats_{fid}" for fid, _ in selected_item_dense_adds(feature_set, False)]
+    names = user_names + item_names
     if enable_delay_history:
         names.extend(DELAY_DENSE_FEATURE_NAMES)
     return names
 
 
+def item_int_feature_names(feature_set: str) -> List[str]:
+    if feature_set == "fe01a":
+        return []
+    return ["item_int_feats_89", "item_int_feats_90"]
+
+
 def build_augmented_schema(
     schema: Dict[str, Any],
     match_count_vocab_size: int,
+    feature_set: str = "fe01",
     enable_delay_history: bool = False,
 ) -> Dict[str, Any]:
+    feature_set = normalize_feature_set(feature_set)
     out = dict(schema)
-    user_dense_adds = list(USER_DENSE_ADDS)
-    item_dense_adds = list(ITEM_DENSE_ADDS)
-    if enable_delay_history:
-        user_dense_adds.extend(USER_DELAY_DENSE_ADDS)
-        item_dense_adds.extend(ITEM_DELAY_DENSE_ADDS)
+    user_dense_adds = selected_user_dense_adds(feature_set, enable_delay_history)
+    item_dense_adds = selected_item_dense_adds(feature_set, enable_delay_history)
+    item_int_adds = selected_item_int_adds(feature_set, match_count_vocab_size)
     out["user_dense"] = _append_feature_specs(out.get("user_dense", []), user_dense_adds)
     out["item_dense"] = _append_feature_specs(out.get("item_dense", []), item_dense_adds)
-    out["item_int"] = _append_feature_specs(
-        out.get("item_int", []),
-        [*ITEM_INT_BASE_ADDS, (90, match_count_vocab_size, 1)],
-    )
+    out["item_int"] = _append_feature_specs(out.get("item_int", []), item_int_adds)
     return out
 
 
@@ -457,9 +508,14 @@ def fit_stats(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
+    feature_set: str = "fe01",
     enable_delay_history: bool = False,
 ) -> Dict[str, RunningStats]:
-    stats = {name: RunningStats() for name in dense_feature_names(enable_delay_history)}
+    feature_set = normalize_feature_set(feature_set)
+    stats = {
+        name: RunningStats()
+        for name in dense_feature_names(feature_set, enable_delay_history)
+    }
     state = PrefixState()
     for _, batch in iter_batches(row_groups, batch_size):
         feats = _compute_raw_features(
@@ -497,8 +553,10 @@ def write_augmented_parquet(
     match_ts_col: str,
     match_window_seconds: int,
     count_edges: Sequence[int],
+    feature_set: str = "fe01",
     enable_delay_history: bool = False,
 ) -> Dict[str, Any]:
+    feature_set = normalize_feature_set(feature_set)
     state = PrefixState()
     writers: Dict[str, pq.ParquetWriter] = {}
     try:
@@ -513,13 +571,13 @@ def write_augmented_parquet(
                 enable_delay_history,
             )
             table = pa.Table.from_batches([batch])
-            for name in dense_feature_names(enable_delay_history):
+            for name in dense_feature_names(feature_set, enable_delay_history):
                 table = _append_or_replace_column(
                     table,
                     name,
                     pa.array(_normalize(name, feats[name], stats), type=pa.float32()),
                 )
-            for name in ["item_int_feats_89", "item_int_feats_90"]:
+            for name in item_int_feature_names(feature_set):
                 table = _append_or_replace_column(
                     table, name, pa.array(feats[name], type=pa.int64()))
 
@@ -549,8 +607,10 @@ def build_alignment(
     match_ts_col: str,
     count_edges: Sequence[int],
     match_window_days: int,
+    feature_set: str = "fe01",
     enable_delay_history: bool = False,
 ) -> Dict[str, Any]:
+    feature_set = normalize_feature_set(feature_set)
     mappings: List[Dict[str, Any]] = [
         {
             "docx_ref": "P005",
@@ -622,16 +682,32 @@ def build_alignment(
             },
         ])
 
+    selected_outputs = set(dense_feature_names(feature_set, enable_delay_history))
+    selected_outputs.update(item_int_feature_names(feature_set))
+    mappings = [m for m in mappings if m.get("output_column") in selected_outputs]
+
     not_included = [
         "delay-aware weighted loss",
         "multi-task learning",
     ]
+    if feature_set == "fe01a":
+        not_included.extend([
+            "user_dense_feats_111 / item_dense_feats_87 purchase frequency",
+            "item_int_feats_89/90 and item_dense_feats_91/92 target-history match features",
+        ])
+    elif feature_set == "fe01b":
+        not_included.extend([
+            "user_dense_feats_110 / item_dense_feats_86 total frequency",
+            "user_dense_feats_111 / item_dense_feats_87 purchase frequency",
+        ])
     if not enable_delay_history:
         not_included.insert(0, "user_dense_feats_112 / item_dense_feats_88 avg delay")
 
+    experiment_name = "FE-02" if enable_delay_history else FEATURE_SET_TO_EXPERIMENT[feature_set]
     return {
         "source_docx": "/Users/gaogang/Downloads/feature-engineering.docx",
-        "experiment": "FE-02" if enable_delay_history else "FE-01",
+        "experiment": experiment_name,
+        "feature_set": feature_set,
         "base_experiment": "FE-01" if enable_delay_history else None,
         "not_included": not_included,
         "mappings": mappings,
@@ -639,11 +715,18 @@ def build_alignment(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build FE-01/FE-02 augmented parquet dataset")
+    ap = argparse.ArgumentParser(description="Build FE-01/FE-01A/FE-01B/FE-02 augmented parquet dataset")
     ap.add_argument("--input_dir", required=True)
     ap.add_argument("--input_schema", required=True)
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--batch_size", type=int, default=8192)
+    ap.add_argument(
+        "--feature_set",
+        choices=["fe01", "fe01a", "fe01b"],
+        default="fe01",
+        help="Ablation feature set: fe01=full safe features, "
+             "fe01a=total frequency only, fe01b=target-history match only.",
+    )
     ap.add_argument("--match_window_days", type=int, default=7)
     ap.add_argument("--match_count_buckets", default="0,1,2,4,8")
     ap.add_argument(
@@ -659,6 +742,9 @@ def main() -> None:
         help="Enable FE-02 historical avg-delay dense features 112 and 88.",
     )
     args = ap.parse_args()
+    args.feature_set = normalize_feature_set(args.feature_set)
+    if args.enable_delay_history and args.feature_set != "fe01":
+        raise ValueError("--enable_delay_history is FE-02 and must be used with --feature_set fe01")
 
     os.makedirs(args.output_dir, exist_ok=True)
     if os.path.abspath(args.input_dir) == os.path.abspath(args.output_dir):
@@ -676,6 +762,7 @@ def main() -> None:
     print(f"Input parquet files: {len(files)}")
     print(f"Input row groups: {len(row_groups)}; fitting stats on first {len(fit_row_groups)}")
     print(f"Resolved FE-01 match columns: {match_col}, {match_ts_col}")
+    print(f"Feature set: {args.feature_set}")
     print(f"Delay history enabled: {args.enable_delay_history}")
     print("Fitting feature-engineering dense normalization stats...")
     stats = fit_stats(
@@ -685,6 +772,7 @@ def main() -> None:
         match_ts_col,
         match_window_seconds,
         count_edges,
+        args.feature_set,
         args.enable_delay_history,
     )
 
@@ -692,12 +780,14 @@ def main() -> None:
     delay_quality = write_augmented_parquet(
         row_groups, args.output_dir, args.batch_size, stats,
         match_col, match_ts_col, match_window_seconds, count_edges,
+        args.feature_set,
         args.enable_delay_history,
     )
 
     augmented_schema = build_augmented_schema(
         schema,
         match_count_vocab_size=len(count_edges) + 1,
+        feature_set=args.feature_set,
         enable_delay_history=args.enable_delay_history,
     )
     output_ns_groups = filter_ns_groups(build_ns_groups(), augmented_schema)
@@ -706,7 +796,10 @@ def main() -> None:
     _write_json(
         os.path.join(args.output_dir, "feature_engineering_stats.json"),
         {
-            "experiment": "FE-02" if args.enable_delay_history else "FE-01",
+            "experiment": "FE-02" if args.enable_delay_history else FEATURE_SET_TO_EXPERIMENT[args.feature_set],
+            "feature_set": args.feature_set,
+            "dense_feature_names": dense_feature_names(args.feature_set, args.enable_delay_history),
+            "item_int_feature_names": item_int_feature_names(args.feature_set),
             "enable_delay_history": args.enable_delay_history,
             "dense_stats": {k: v.to_dict() for k, v in stats.items()},
             "match_col": match_col,
@@ -722,14 +815,26 @@ def main() -> None:
     )
     _write_json(
         os.path.join(args.output_dir, "docx_alignment.fe01.json"),
-        build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, False),
+        build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, args.feature_set, False),
     )
+    if args.feature_set in {"fe01a", "fe01b"}:
+        _write_json(
+            os.path.join(args.output_dir, f"docx_alignment.{args.feature_set}.json"),
+            build_alignment(
+                match_col,
+                match_ts_col,
+                count_edges,
+                args.match_window_days,
+                args.feature_set,
+                False,
+            ),
+        )
     if args.enable_delay_history:
         _write_json(
             os.path.join(args.output_dir, "docx_alignment.fe02.json"),
-            build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, True),
+            build_alignment(match_col, match_ts_col, count_edges, args.match_window_days, "fe01", True),
         )
-    experiment_name = "FE-02" if args.enable_delay_history else "FE-01"
+    experiment_name = "FE-02" if args.enable_delay_history else FEATURE_SET_TO_EXPERIMENT[args.feature_set]
     print(f"Wrote {experiment_name} dataset to: {args.output_dir}")
 
 

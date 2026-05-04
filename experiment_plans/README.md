@@ -10,6 +10,10 @@
 | `FE00/experiment_00_preprocess_alignment_plan.zh.md` | FE-00 缺失处理与归一化对齐 |
 | `FE01/README.md` | FE-01 子目录索引、代码文件和上传清单 |
 | `FE01/experiment_01_feature_engineering_plan.zh.md` | FE-01 安全特征增强方案 |
+| `FE01A/README.md` | FE-01A total frequency 消融实验索引 |
+| `FE01A/experiment_01a_total_frequency_plan.zh.md` | FE-01A total frequency only 方案 |
+| `FE01B/README.md` | FE-01B target match 消融实验索引 |
+| `FE01B/experiment_01b_target_match_plan.zh.md` | FE-01B target-history match only 方案 |
 | `FE02/README.md` | FE-02 子目录索引、代码文件和上传清单 |
 | `FE02/experiment_02_delay_history_features_plan.zh.md` | FE-02 历史 delay 特征方案 |
 | `feature_engineering_design_alignment_audit.zh.md` | 上传 DOCX 与实验计划逐条对齐审计 |
@@ -24,6 +28,8 @@
 B0 baseline
 FE-00 missing handling + dense normalization alignment
 FE-01 safe frequency + match features
+FE-01A total frequency only ablation
+FE-01B target-history match only ablation
 FE-02 historical delay features
 FE-03 delay-aware weighted loss
 FE-04 multi-task conversion + delay bucket + engagement

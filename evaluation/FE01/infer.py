@@ -380,6 +380,9 @@ def maybe_build_fe01_eval_dataset(
             "Checkpoint schema expects columns that FE-01 infer.py cannot generate: "
             + ", ".join(unsupported)
         )
+    expected_user_dense = [name for name in FE01_USER_DENSE_COLUMNS if name in expected]
+    expected_item_dense = [name for name in FE01_ITEM_DENSE_COLUMNS if name in expected]
+    expected_item_int = [name for name in FE01_ITEM_INT_COLUMNS if name in expected]
 
     logging.info(f"Eval parquet missing FE-01 columns: {missing}")
     stats = _load_fe01_stats(model_dir)
@@ -412,7 +415,7 @@ def maybe_build_fe01_eval_dataset(
             feats = _compute_raw_fe01_features(
                 batch, state, match_col, match_ts_col, match_window_seconds, count_edges)
             table = pa.Table.from_batches([batch])
-            for name in FE01_USER_DENSE_COLUMNS + FE01_ITEM_DENSE_COLUMNS:
+            for name in expected_user_dense + expected_item_dense:
                 table = _append_or_replace_column(
                     table,
                     name,
@@ -421,7 +424,7 @@ def maybe_build_fe01_eval_dataset(
                         type=pa.float32(),
                     ),
                 )
-            for name in FE01_ITEM_INT_COLUMNS:
+            for name in expected_item_int:
                 table = _append_or_replace_column(
                     table, name, pa.array(feats[name], type=pa.int64()))
 

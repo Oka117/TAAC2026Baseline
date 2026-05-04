@@ -165,6 +165,8 @@ class PCVRHyFormerRankingTrainer:
                 # same checkpoint packaging path.
                 'feature_engineering_stats.json',
                 'docx_alignment.fe01.json',
+                'docx_alignment.fe01a.json',
+                'docx_alignment.fe01b.json',
                 'docx_alignment.fe02.json',
             ):
                 sidecar_path = os.path.join(schema_dir, sidecar_name)
