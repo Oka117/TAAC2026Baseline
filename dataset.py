@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
 from torch.utils.data import IterableDataset, DataLoader
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
 # no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
@@ -132,6 +132,20 @@ BUCKET_BOUNDARIES = np.array([
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
 
+def load_domain_time_bucket_boundaries(path: Optional[str]) -> Optional[Dict[str, List[int]]]:
+    """Load per-domain time bucket boundaries from a JSON sidecar."""
+    if not path:
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    out: Dict[str, List[int]] = {}
+    for domain, values in raw.items():
+        clean = sorted({int(v) for v in values if int(v) > 0})
+        if clean:
+            out[str(domain)] = clean
+    return out
+
+
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
 
@@ -154,6 +168,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_indices: Optional[List[int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        domain_time_buckets: Optional[Dict[str, Sequence[int]]] = None,
     ) -> None:
         """
         Args:
@@ -173,6 +188,10 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            domain_time_buckets: optional mapping from sequence-domain name to
+                bucket boundaries. When provided, bucket ids are offset per
+                domain so a single time embedding table still represents
+                domain-specific bucket semantics.
         """
         super().__init__()
 
@@ -212,6 +231,7 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+        self._configure_time_buckets(domain_time_buckets)
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -281,6 +301,56 @@ class PCVRParquetDataset(IterableDataset):
             f"PCVRParquetDataset: {self.num_rows} rows from "
             f"{len(self._parquet_files)} file(s), batch_size={batch_size}, "
             f"buffer_batches={buffer_batches}, shuffle={shuffle}")
+
+    def _domain_bucket_values(
+        self,
+        domain_time_buckets: Dict[str, Sequence[int]],
+        domain: str,
+    ) -> Optional[List[int]]:
+        aliases = [domain]
+        if domain.startswith('seq_'):
+            aliases.append('domain_' + domain.split('_', 1)[1])
+        elif domain.startswith('domain_'):
+            aliases.append('seq_' + domain.split('_', 1)[1])
+        prefix = self._seq_prefix.get(domain)
+        if prefix:
+            aliases.append(prefix[:-1] if prefix.endswith('_') else prefix)
+        for key in aliases:
+            if key in domain_time_buckets:
+                return sorted({int(v) for v in domain_time_buckets[key] if int(v) > 0})
+        return None
+
+    def _configure_time_buckets(
+        self,
+        domain_time_buckets: Optional[Dict[str, Sequence[int]]],
+    ) -> None:
+        self._time_bucket_boundaries: Dict[str, np.ndarray] = {}
+        self._time_bucket_offsets: Dict[str, int] = {}
+        if not domain_time_buckets:
+            for domain in self.seq_domains:
+                self._time_bucket_boundaries[domain] = BUCKET_BOUNDARIES
+                self._time_bucket_offsets[domain] = 0
+            self.num_time_buckets = NUM_TIME_BUCKETS
+            self.uses_domain_time_buckets = False
+            return
+
+        offset = 0
+        for domain in self.seq_domains:
+            values = self._domain_bucket_values(domain_time_buckets, domain)
+            boundaries = np.array(values if values else BUCKET_BOUNDARIES.tolist(), dtype=np.int64)
+            self._time_bucket_boundaries[domain] = boundaries
+            self._time_bucket_offsets[domain] = offset
+            offset += int(len(boundaries))
+        self.num_time_buckets = offset + 1
+        self.uses_domain_time_buckets = True
+        logging.info(
+            "Using domain-specific time buckets: "
+            + ", ".join(
+                f"{domain}={len(self._time_bucket_boundaries[domain])}"
+                for domain in self.seq_domains
+            )
+            + f"; num_time_buckets={self.num_time_buckets}"
+        )
 
     def _load_schema(self, schema_path: str, seq_max_lens: Dict[str, int]) -> None:
         """Populate per-group schema information from ``schema_path``."""
@@ -679,6 +749,8 @@ class PCVRParquetDataset(IterableDataset):
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
+                boundaries = self._time_bucket_boundaries[domain]
+                offset = self._time_bucket_offsets[domain]
                 # np.searchsorted returns values in [0, len(BUCKET_BOUNDARIES)].
                 # After +1 the nominal range is [1, len(BUCKET_BOUNDARIES)+1];
                 # the upper bound only appears when time_diff exceeds the
@@ -688,13 +760,14 @@ class PCVRParquetDataset(IterableDataset):
                 # bucket id (after +1) stays within [1, len(BUCKET_BOUNDARIES)]
                 # and is always a valid Embedding index. Time-diffs beyond the
                 # largest boundary collapse into the last bucket.
-                raw_buckets = np.clip(
-                    np.searchsorted(BUCKET_BOUNDARIES, time_diff.ravel()),
-                    0, len(BUCKET_BOUNDARIES) - 1,
-                )
-                buckets = raw_buckets.reshape(B, max_len) + 1
-                buckets[ts_padded == 0] = 0
-                time_bucket[:] = buckets
+                if len(boundaries) > 0:
+                    raw_buckets = np.clip(
+                        np.searchsorted(boundaries, time_diff.ravel()),
+                        0, len(boundaries) - 1,
+                    )
+                    buckets = raw_buckets.reshape(B, max_len) + offset + 1
+                    buckets[ts_padded == 0] = 0
+                    time_bucket[:] = buckets
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
@@ -714,6 +787,7 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     split_by_timestamp: bool = False,
+    domain_time_buckets: Optional[Dict[str, Sequence[int]]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -784,6 +858,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_indices=train_indices,
         clip_vocab=clip_vocab,
+        domain_time_buckets=domain_time_buckets,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -806,6 +881,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_indices=valid_indices,
         clip_vocab=clip_vocab,
+        domain_time_buckets=domain_time_buckets,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
