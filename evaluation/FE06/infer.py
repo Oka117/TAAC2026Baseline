@@ -175,6 +175,13 @@ def _parquet_files(input_dir: str) -> List[str]:
     return files
 
 
+def _parquet_num_rows(files: Sequence[str]) -> int:
+    total = 0
+    for path in files:
+        total += int(pq.ParquetFile(path).metadata.num_rows)
+    return total
+
+
 def _iter_batches(files: Sequence[str], batch_size: int) -> Iterable[Tuple[str, pa.RecordBatch]]:
     for path in files:
         pf = pq.ParquetFile(path)
@@ -558,6 +565,8 @@ def maybe_build_fe06_eval_dataset(
         return data_dir
 
     files = _parquet_files(data_dir)
+    input_rows = _parquet_num_rows(files)
+    logging.info(f"FE-06 eval input parquet files: {len(files)}, rows: {input_rows}")
     first_names = pq.ParquetFile(files[0]).schema_arrow.names
     expected_generated = [
         'user_dense_feats_110',
@@ -571,6 +580,7 @@ def maybe_build_fe06_eval_dataset(
     ]
     if all(name in first_names for name in expected_generated):
         logging.info("Eval parquet already contains FE-06 generated columns; using raw eval directory.")
+        logging.info(f"FE-06 eval dataset rows: {input_rows}")
         return data_dir
 
     dense_stats = stats.get('dense_stats', {})
@@ -597,8 +607,10 @@ def maybe_build_fe06_eval_dataset(
 
     state = FE06PrefixState()
     writers: Dict[str, pq.ParquetWriter] = {}
+    written_rows = 0
     try:
         for input_path, batch in _iter_batches(files, batch_size):
+            written_rows += batch.num_rows
             idx = {name: i for i, name in enumerate(batch.schema.names)}
             table = pa.Table.from_batches([batch])
 
@@ -653,6 +665,7 @@ def maybe_build_fe06_eval_dataset(
         for writer in writers.values():
             writer.close()
 
+    logging.info(f"FE-06 eval transformed rows: {written_rows}")
     return output_dir
 
 
