@@ -78,6 +78,8 @@ def parse_args() -> argparse.Namespace:
                         help='Fraction of training Row Groups to use (takes the first N%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
+    parser.add_argument('--split_by_timestamp', action='store_true', default=False,
+                        help='Sort row groups by max(timestamp) before taking the validation tail')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
                         help='Run validation every N steps '
                              '(0 = only at the end of each epoch)')
@@ -193,6 +195,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--item_ns_tokens', type=int, default=0,
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
+    parser.add_argument('--use_token_gnn', action='store_true', default=False,
+                        help='Enable a lightweight 4-layer TokenGNN over NS tokens')
+    parser.add_argument('--token_gnn_layers', type=int, default=4,
+                        help='Number of TokenGNN layers over NS tokens')
+    parser.add_argument('--token_gnn_graph', type=str, default='full',
+                        choices=['full'],
+                        help='TokenGNN graph type; full = complete graph over NS tokens')
+    parser.add_argument('--token_gnn_layer_scale', type=float, default=0.15,
+                        help='Initial residual scale for each TokenGNN layer')
 
     args = parser.parse_args()
 
@@ -264,6 +275,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        split_by_timestamp=args.split_by_timestamp,
     )
 
     # ---- NS groups ----
@@ -316,6 +328,10 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "use_token_gnn": args.use_token_gnn,
+        "token_gnn_layers": args.token_gnn_layers,
+        "token_gnn_graph": args.token_gnn_graph,
+        "token_gnn_layer_scale": args.token_gnn_layer_scale,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -324,7 +340,13 @@ def main() -> None:
     num_sequences = len(pcvr_dataset.seq_domains)
     num_ns = model.num_ns
     T = args.num_queries * num_sequences + num_ns
-    logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
+    logging.info(
+        f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, "
+        f"d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}, "
+        f"use_token_gnn={args.use_token_gnn}, "
+        f"token_gnn_layers={args.token_gnn_layers}, "
+        f"token_gnn_graph={args.token_gnn_graph}, "
+        f"token_gnn_layer_scale={args.token_gnn_layer_scale}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

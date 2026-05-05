@@ -164,10 +164,12 @@ class PCVRHyFormerRankingTrainer:
                 # Useful FE-01 audit sidecars if later experiments reuse the
                 # same checkpoint packaging path.
                 'feature_engineering_stats.json',
+                'fe06_transform_stats.json',
                 'docx_alignment.fe01.json',
                 'docx_alignment.fe01a.json',
                 'docx_alignment.fe01b.json',
                 'docx_alignment.fe02.json',
+                'docx_alignment.fe06.json',
             ):
                 sidecar_path = os.path.join(schema_dir, sidecar_name)
                 if os.path.exists(sidecar_path):
