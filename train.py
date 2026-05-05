@@ -19,7 +19,7 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import FeatureSchema, get_pcvr_data, load_domain_time_bucket_boundaries
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -125,6 +125,10 @@ def parse_args() -> argparse.Namespace:
                              'dataset.BUCKET_BOUNDARIES; this flag is a pure on/off switch.')
     parser.add_argument('--no_time_buckets', dest='use_time_buckets', action='store_false',
                         help='Disable the time-bucket embedding')
+    parser.add_argument('--domain_time_buckets', action='store_true', default=False,
+                        help='Use per-domain time bucket boundaries from --domain_bucket_path')
+    parser.add_argument('--domain_bucket_path', type=str, default=None,
+                        help='JSON sidecar mapping sequence domain names to time bucket boundaries')
     parser.add_argument('--rank_mixer_mode', type=str, default='full',
                         choices=['full', 'ffn_only', 'none'],
                         help='RankMixerBlock mode: '
@@ -264,6 +268,15 @@ def main() -> None:
             seq_max_lens[k.strip()] = int(v.strip())
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
+    domain_time_buckets = None
+    if args.domain_time_buckets:
+        if not args.domain_bucket_path:
+            raise ValueError("--domain_time_buckets requires --domain_bucket_path")
+        domain_time_buckets = load_domain_time_bucket_boundaries(args.domain_bucket_path)
+        if not domain_time_buckets:
+            raise ValueError(f"No usable domain time bucket boundaries in {args.domain_bucket_path}")
+        logging.info(f"Loaded domain time bucket boundaries from {args.domain_bucket_path}")
+
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
@@ -276,6 +289,7 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         split_by_timestamp=args.split_by_timestamp,
+        domain_time_buckets=domain_time_buckets,
     )
 
     # ---- NS groups ----
@@ -319,7 +333,7 @@ def main() -> None:
         "seq_top_k": args.seq_top_k,
         "seq_causal": args.seq_causal,
         "action_num": args.action_num,
-        "num_time_buckets": NUM_TIME_BUCKETS if args.use_time_buckets else 0,
+        "num_time_buckets": pcvr_dataset.num_time_buckets if args.use_time_buckets else 0,
         "rank_mixer_mode": args.rank_mixer_mode,
         "use_rope": args.use_rope,
         "rope_base": args.rope_base,
@@ -346,7 +360,8 @@ def main() -> None:
         f"use_token_gnn={args.use_token_gnn}, "
         f"token_gnn_layers={args.token_gnn_layers}, "
         f"token_gnn_graph={args.token_gnn_graph}, "
-        f"token_gnn_layer_scale={args.token_gnn_layer_scale}")
+        f"token_gnn_layer_scale={args.token_gnn_layer_scale}, "
+        f"num_time_buckets={model_args['num_time_buckets']}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
     total_params = sum(p.numel() for p in model.parameters())

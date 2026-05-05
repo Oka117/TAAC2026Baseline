@@ -14,6 +14,7 @@
 | FE-02 | 历史 avg delay dense | 扩展 FE 脚本 | 沿用 FE-01 | `+0.0002 ~ +0.0010` |
 | FE-03 | delay-aware weighted BCE | `trainer.py`, `train.py`, `dataset.py` | `fast_boost alpha=0.3 clip=3.0` | `-0.0003 ~ +0.0008` |
 | FE-04 | conversion + delay bucket + engagement multi-task | `model.py`, `trainer.py`, `train.py`, `dataset.py` | `delay_loss_weight=0.05, engagement_loss_weight=0.02` | `+0.0003 ~ +0.0015` |
+| FE-07 Domain-main | FE00 + 01AB + Claude P0/P1 + P2-Domain | 新增 FE07 builder/eval；实现 per-domain bucket | `user_ns_tokens=6,item_ns_tokens=4,num_queries=1,seq_c=128,seq_d=768` | Eval `0.8150 ~ 0.8190` |
 
 ## 推荐保留策略
 
@@ -25,6 +26,7 @@
 5. FE-02 只有在 FE-01A/FE-01B 找到稳定模块后再接。
 6. FE-03 的收益不确定，必须同时看 AUC 和 logloss。
 7. FE-04 是论文/创新方向更强的实验，但工程风险最高。
+8. FE-07 只验证 P0 domain summary 与 P2-Domain，不加入 GNN / TokenGNN 结构；不要把 per-domain bucket 和 seq length 一次性混成唯一实验点。
 ```
 
 ## 结果记录模板
