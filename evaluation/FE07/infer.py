@@ -179,12 +179,39 @@ def _parquet_files(input_dir: str) -> List[str]:
     return files
 
 
-def _iter_batches(files: Sequence[str], batch_size: int) -> Iterable[Tuple[str, pa.RecordBatch]]:
+def _iter_batches(
+    files: Sequence[str],
+    batch_size: int,
+    columns: Optional[Sequence[str]] = None,
+) -> Iterable[Tuple[str, pa.RecordBatch]]:
+    read_columns = None if columns is None else list(dict.fromkeys(columns))
     for path in files:
         pf = pq.ParquetFile(path)
         for rg_idx in range(pf.metadata.num_row_groups):
-            for batch in pf.iter_batches(batch_size=batch_size, row_groups=[rg_idx]):
+            for batch in pf.iter_batches(
+                batch_size=batch_size,
+                row_groups=[rg_idx],
+                columns=read_columns,
+            ):
                 yield path, batch
+
+
+def _schema_required_parquet_columns(schema_path: str) -> List[str]:
+    schema = _load_json(schema_path)
+    columns: List[str] = ['user_id', 'timestamp']
+    for fid, _, _ in schema.get('user_int', []):
+        columns.append(f'user_int_feats_{int(fid)}')
+    for fid, _, _ in schema.get('item_int', []):
+        columns.append(f'item_int_feats_{int(fid)}')
+    for fid, _ in schema.get('user_dense', []):
+        columns.append(f'user_dense_feats_{int(fid)}')
+    for fid, _ in schema.get('item_dense', []):
+        columns.append(f'item_dense_feats_{int(fid)}')
+    for cfg in schema.get('seq', {}).values():
+        prefix = str(cfg.get('prefix', ''))
+        for fid, _ in cfg.get('features', []):
+            columns.append(f'{prefix}_{int(fid)}')
+    return list(dict.fromkeys(columns))
 
 
 def _strip_prefix(prefix: str) -> str:
@@ -594,36 +621,82 @@ def maybe_build_fe07_eval_dataset(
     min_timestamp = int(stats.get('min_timestamp_for_day_since', 0))
     match_window_seconds = int(stats.get('match_window_days', 7)) * 86400
     int_fill_audit = stats.get('int_fill_audit', {})
+    transform_batch_size = int(os.environ.get(
+        'FE07_EVAL_TRANSFORM_BATCH_SIZE',
+        stats.get('transform_batch_size', 8192),
+    ))
 
-    missing_base = [name for name in (match_col, match_ts_col, 'item_int_feats_9', 'timestamp') if name not in first_names]
+    missing_base = [
+        name for name in ('user_id', 'item_id', 'timestamp', 'item_int_feats_9', match_col, match_ts_col)
+        if name not in first_names
+    ]
     if missing_base:
         raise KeyError("FE-07 eval transform missing required raw columns: " + ", ".join(missing_base))
 
-    output_dir = os.environ.get('FE07_EVAL_DATA_DIR')
-    if not output_dir:
+    output_base_dir = os.environ.get('FE07_EVAL_DATA_DIR')
+    if output_base_dir:
+        os.makedirs(output_base_dir, exist_ok=True)
+        output_dir = tempfile.mkdtemp(prefix='materialized_', dir=output_base_dir)
+    else:
         output_dir = tempfile.mkdtemp(prefix='taac_fe07_eval_')
     os.makedirs(output_dir, exist_ok=True)
     logging.info(f"Writing FE-07 eval parquet to: {output_dir}")
+    logging.info(f"FE-07 eval transform batch_size={transform_batch_size}")
     logging.info(
         "FE-07 eval transform ignores eval label_type; total-frequency state "
         "starts from zero and uses only eval stream order.")
 
+    required_output = _schema_required_parquet_columns(schema_path)
+    required_set = set(required_output)
+    generated_set = set(expected_generated)
+    required_raw_output = [
+        name for name in required_output
+        if name in first_names and name not in generated_set
+    ]
+    read_columns = set(required_raw_output)
+    read_columns.update(['user_id', 'item_id', 'timestamp', 'item_int_feats_9', match_col, match_ts_col])
+    read_columns.update(seq_ts_cols.values())
+    read_columns.update(
+        name for name in int_fill_audit
+        if name in first_names and (name.startswith('user_int_feats_') or name.startswith('item_int_feats_'))
+    )
+    read_columns.update(
+        name for name in dense_stats
+        if name in first_names and name not in generated_set
+    )
+    read_columns = [name for name in first_names if name in read_columns]
+
     fill_empty_int_lists = bool(stats.get('fill_empty_int_lists', False))
     state = FE07PrefixState()
-    writers: Dict[str, pq.ParquetWriter] = {}
+    output_path = os.path.join(output_dir, 'part-00000.parquet')
+    writer: Optional[pq.ParquetWriter] = None
+    processed_rows = 0
+    processed_batches = 0
     try:
-        for input_path, batch in _iter_batches(files, batch_size):
+        for _input_path, batch in _iter_batches(files, transform_batch_size, columns=read_columns):
+            processed_batches += 1
+            processed_rows += batch.num_rows
+            if processed_batches == 1 or processed_batches % 100 == 0:
+                logging.info(
+                    f"FE-07 eval transform processed {processed_rows} rows "
+                    f"({processed_batches} batches)")
             idx = {name: i for i, name in enumerate(batch.schema.names)}
-            table = pa.Table.from_batches([batch])
+            input_table = pa.Table.from_batches([batch])
+            table = input_table.select([
+                name for name in input_table.schema.names
+                if name in required_set and name not in generated_set
+            ])
 
             for name, audit in int_fill_audit.items():
-                if name in idx and (name.startswith('user_int_feats_') or name.startswith('item_int_feats_')):
+                if name in idx and name in required_set and (
+                    name.startswith('user_int_feats_') or name.startswith('item_int_feats_')
+                ):
                     fill_value = int(audit.get('fill_value', 0))
                     table = _fe07_append_or_replace_column(
                         table, name, _fe07_fill_int_column(batch.column(idx[name]), fill_value, fill_empty_int_lists))
 
             for name in dense_stats:
-                if name in idx and name not in expected_generated:
+                if name in idx and name in required_set and name not in generated_set:
                     table = _fe07_append_or_replace_column(
                         table, name, _normalize_fe07_dense_column(batch.column(idx[name]), name, dense_stats))
 
@@ -654,17 +727,22 @@ def maybe_build_fe07_eval_dataset(
                 table = _fe07_append_or_replace_column(table, name, arr)
 
             for name in ['item_int_feats_89', 'item_int_feats_90']:
-                table = _fe07_append_or_replace_column(
-                    table, name, pa.array(feats[name], type=pa.int64()))
+                if name in required_set:
+                    table = _fe07_append_or_replace_column(
+                        table, name, pa.array(feats[name], type=pa.int64()))
 
-            out_path = os.path.join(output_dir, os.path.basename(input_path))
-            writer = writers.get(out_path)
+            missing_output = [name for name in required_output if name not in table.schema.names]
+            if missing_output:
+                raise KeyError(
+                    "FE-07 eval transform could not materialize required columns: "
+                    + ", ".join(missing_output[:20])
+                )
+            table = table.select(required_output)
             if writer is None:
-                writer = pq.ParquetWriter(out_path, table.schema, compression='snappy')
-                writers[out_path] = writer
+                writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
             writer.write_table(table)
     finally:
-        for writer in writers.values():
+        if writer is not None:
             writer.close()
 
     return output_dir
@@ -1018,6 +1096,7 @@ def main() -> None:
 
     all_probs = []
     all_user_ids = []
+    processed_count = 0
     logging.info("Starting inference...")
 
     with torch.no_grad():
@@ -1030,9 +1109,10 @@ def main() -> None:
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
+            processed_count += len(probs)
 
             if (batch_idx + 1) % 100 == 0:
-                logging.info(f"  Processed {(batch_idx + 1) * batch_size} samples")
+                logging.info(f"  Processed {processed_count} samples")
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
 

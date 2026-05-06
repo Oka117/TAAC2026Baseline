@@ -1037,6 +1037,7 @@ def main() -> None:
             "fit_stats_row_group_ratio": args.fit_stats_row_group_ratio,
             "fit_stats_row_groups": len(fit_row_groups),
             "diagnostic_row_groups": len(diagnostic_row_groups),
+            "transform_batch_size": args.batch_size,
             "total_row_groups": len(row_groups),
             "input_diagnostics": diagnostics,
             "fit_diagnostics": fit_diagnostics,
