@@ -15,11 +15,11 @@ Environment variables:
                        sub-directory containing ``model.pt`` / ``train_config.json``).
     EVAL_DATA_PATH     Test data directory (*.parquet + schema.json).
     EVAL_RESULT_PATH   Directory for the generated ``predictions.json``.
-    FE07_EVAL_EXACT_FEATURES
-                       Optional. Set to 1/true/yes to compute exact FE-07
-                       generated eval features. The default fast path fills
-                       generated columns with neutral values to fit the
-                       competition inference timeout.
+    FE07_EVAL_FAST_NEUTRAL
+                       Optional emergency fallback. Set to 1/true/yes to fill
+                       FE-07 generated eval features with neutral values. The
+                       default path computes exact generated features so eval
+                       predictions match the trained feature contract.
 """
 
 import os
@@ -335,13 +335,14 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
         self.schema_path = schema_path
         self.infer_batch_size = infer_batch_size
         self.transform_batch_size = transform_batch_size
-        self.fast_generated_features = os.environ.get(
-            'FE07_EVAL_EXACT_FEATURES', '').lower() not in {'1', 'true', 'yes'}
+        self.neutral_generated_features = os.environ.get(
+            'FE07_EVAL_FAST_NEUTRAL', '').lower() in {'1', 'true', 'yes'}
         logging.info(
             "Using FE-07 on-the-fly eval transform: "
             f"transform_batch_size={transform_batch_size}, "
             f"infer_batch_size={infer_batch_size}, "
-            f"fast_generated_features={self.fast_generated_features}")
+            f"exact_generated_features={not self.neutral_generated_features}, "
+            f"neutral_generated_features={self.neutral_generated_features}")
 
         stats = _load_fe07_stats(model_dir)
         if stats is None:
@@ -478,10 +479,10 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
                     _normalize_fe07_dense_column(batch.column(idx[name]), name, self.dense_stats),
                 )
 
-        if self.fast_generated_features:
+        if self.neutral_generated_features:
             table = self._append_fast_generated_features(table, batch.num_rows)
         else:
-            feats = _fe07_compute_generated_features(
+            feats = _compute_fe07_generated_features_fast(
                 batch,
                 state,
                 self.match_col,
@@ -614,6 +615,218 @@ def _list_values(arr: pa.Array) -> List[List[int]]:
 def _bucketize_counts(counts: np.ndarray, edges: Sequence[int]) -> np.ndarray:
     upper_edges = np.asarray(list(edges)[1:], dtype=np.int64)
     return (np.searchsorted(upper_edges, counts, side='right') + 1).astype(np.int64)
+
+
+def _is_arrow_list(arr: pa.Array) -> bool:
+    return pa.types.is_list(arr.type) or pa.types.is_large_list(arr.type)
+
+
+def _list_offsets_values_int(arr: pa.Array) -> Tuple[np.ndarray, np.ndarray]:
+    if not _is_arrow_list(arr):
+        raise TypeError(f"Expected Arrow list array, got {arr.type}")
+    offsets = arr.offsets.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    values = arr.values.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=True)
+    return offsets, values
+
+
+def _first_positive_scalar_array(arr: pa.Array) -> np.ndarray:
+    if not _is_arrow_list(arr):
+        return _to_int_array(arr)
+    offsets, values = _list_offsets_values_int(arr)
+    out = np.zeros(len(arr), dtype=np.int64)
+    for i in range(len(arr)):
+        row = values[offsets[i]:offsets[i + 1]]
+        positive = row[row > 0]
+        if positive.size:
+            out[i] = int(positive[0])
+    return out
+
+
+def _row_ids_from_offsets(offsets: np.ndarray) -> np.ndarray:
+    lengths = np.diff(offsets)
+    if lengths.size == 0 or int(lengths.sum()) == 0:
+        return np.empty(0, dtype=np.int64)
+    return np.repeat(np.arange(lengths.size, dtype=np.int64), lengths)
+
+
+def _bincount_rows(row_ids: np.ndarray, mask: np.ndarray, num_rows: int) -> np.ndarray:
+    if row_ids.size == 0 or not bool(mask.any()):
+        return np.zeros(num_rows, dtype=np.float32)
+    return np.bincount(row_ids[mask], minlength=num_rows).astype(np.float32)
+
+
+def _compute_prefix_totals_fast(
+    user_ids: np.ndarray,
+    item_ids: np.ndarray,
+    timestamps: np.ndarray,
+    state: FE07PrefixState,
+) -> Tuple[np.ndarray, np.ndarray]:
+    num_rows = len(timestamps)
+    user_total = np.zeros(num_rows, dtype=np.float32)
+    item_total = np.zeros(num_rows, dtype=np.float32)
+    row_order = np.argsort(timestamps, kind='stable')
+    for i in row_order:
+        uid = int(user_ids[i])
+        iid = int(item_ids[i])
+        ut, it = state.before_update(uid, iid)
+        user_total[i] = ut
+        item_total[i] = it
+        state.update(uid, iid)
+    return user_total, item_total
+
+
+def _compute_domain_summary_fast(
+    batch: pa.RecordBatch,
+    timestamps: np.ndarray,
+    seq_ts_cols: Dict[str, str],
+) -> np.ndarray:
+    idx = {name: i for i, name in enumerate(batch.schema.names)}
+    num_rows = batch.num_rows
+    seq_summary_parts: List[np.ndarray] = []
+    for domain in sorted(seq_ts_cols):
+        ts_col = seq_ts_cols[domain]
+        summary = np.zeros((num_rows, 5), dtype=np.float32)
+        if ts_col not in idx:
+            seq_summary_parts.append(summary)
+            continue
+        offsets, event_times = _list_offsets_values_int(batch.column(idx[ts_col]))
+        row_ids = _row_ids_from_offsets(offsets)
+        if row_ids.size:
+            now = timestamps[row_ids]
+            valid = (event_times > 0) & (event_times <= now)
+            summary[:, 0] = np.log1p(_bincount_rows(row_ids, valid, num_rows))
+            deltas = now - event_times
+            for wi, window in enumerate((3600, 86400, 604800, 2592000)):
+                summary[:, wi + 1] = np.log1p(
+                    _bincount_rows(row_ids, valid & (deltas <= window), num_rows)
+                )
+        seq_summary_parts.append(summary)
+    if not seq_summary_parts:
+        return np.zeros((num_rows, 0), dtype=np.float32)
+    return np.concatenate(seq_summary_parts, axis=1).astype(np.float32)
+
+
+def _compute_target_match_fast(
+    batch: pa.RecordBatch,
+    target_item_attr: np.ndarray,
+    timestamps: np.ndarray,
+    match_col: str,
+    match_ts_col: str,
+    match_window_seconds: int,
+    count_edges: Sequence[int],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    idx = {name: i for i, name in enumerate(batch.schema.names)}
+    values_arr = batch.column(idx[match_col])
+    times_arr = batch.column(idx[match_ts_col])
+    if (
+        not _is_arrow_list(values_arr)
+        or not _is_arrow_list(times_arr)
+        or values_arr.values.null_count
+        or times_arr.values.null_count
+    ):
+        return None
+
+    value_offsets, seq_values = _list_offsets_values_int(values_arr)
+    time_offsets, seq_times = _list_offsets_values_int(times_arr)
+    if not np.array_equal(np.diff(value_offsets), np.diff(time_offsets)):
+        return None
+
+    num_rows = batch.num_rows
+    row_ids = _row_ids_from_offsets(value_offsets)
+    match_count = np.zeros(num_rows, dtype=np.int64)
+    min_match_delta = np.zeros(num_rows, dtype=np.float32)
+    match_count_7d = np.zeros(num_rows, dtype=np.float32)
+
+    if row_ids.size:
+        target_for_event = target_item_attr[row_ids]
+        matched = (target_for_event > 0) & (seq_values == target_for_event)
+        if bool(matched.any()):
+            match_count = np.bincount(row_ids[matched], minlength=num_rows).astype(np.int64)
+            matched_positive_time = matched & (seq_times > 0)
+            if bool(matched_positive_time.any()):
+                matched_rows = row_ids[matched_positive_time]
+                deltas = np.maximum(
+                    timestamps[matched_rows] - seq_times[matched_positive_time],
+                    0,
+                ).astype(np.int64)
+                min_delta = np.full(num_rows, np.iinfo(np.int64).max, dtype=np.int64)
+                np.minimum.at(min_delta, matched_rows, deltas)
+                observed = min_delta != np.iinfo(np.int64).max
+                min_match_delta[observed] = min_delta[observed].astype(np.float32)
+                match_count_7d = np.bincount(
+                    matched_rows[deltas <= match_window_seconds],
+                    minlength=num_rows,
+                ).astype(np.float32)
+
+    has_match = np.where(
+        target_item_attr > 0,
+        np.where(match_count > 0, 2, 1),
+        0,
+    ).astype(np.int64)
+    return has_match, _bucketize_counts(match_count, count_edges), min_match_delta, match_count_7d
+
+
+def _compute_fe07_generated_features_fast(
+    batch: pa.RecordBatch,
+    state: FE07PrefixState,
+    match_col: str,
+    match_ts_col: str,
+    seq_ts_cols: Dict[str, str],
+    min_timestamp: int,
+    match_window_seconds: int,
+    count_edges: Sequence[int],
+) -> Dict[str, np.ndarray]:
+    names = batch.schema.names
+    idx = {name: i for i, name in enumerate(names)}
+    user_ids = _to_int_array(batch.column(idx['user_id']))
+    item_ids = _to_int_array(batch.column(idx['item_id']))
+    timestamps = _to_int_array(batch.column(idx['timestamp']))
+
+    if 'item_int_feats_9' not in idx:
+        raise KeyError("FE-07 requires item_int_feats_9 for target-history match")
+    target_item_attr = _first_positive_scalar_array(batch.column(idx['item_int_feats_9']))
+
+    match_features = _compute_target_match_fast(
+        batch,
+        target_item_attr,
+        timestamps,
+        match_col,
+        match_ts_col,
+        match_window_seconds,
+        count_edges,
+    )
+    if match_features is None:
+        return _fe07_compute_generated_features(
+            batch,
+            state,
+            match_col,
+            match_ts_col,
+            seq_ts_cols,
+            min_timestamp,
+            match_window_seconds,
+            count_edges,
+        )
+    has_match, match_count_bucket, min_match_delta, match_count_7d = match_features
+
+    user_total, item_total = _compute_prefix_totals_fast(user_ids, item_ids, timestamps, state)
+    hour = ((timestamps // 3600) % 24).astype(np.float32) / 23.0
+    dow = (((timestamps // 86400) + 4) % 7).astype(np.float32) / 6.0
+    day_since_min = np.log1p(
+        np.maximum(timestamps - int(min_timestamp), 0) // 86400
+    ).astype(np.float32)
+    time_context = np.stack([hour, dow, day_since_min], axis=1).astype(np.float32)
+    domain_summary = _compute_domain_summary_fast(batch, timestamps, seq_ts_cols)
+
+    return {
+        'user_dense_feats_110': np.log1p(user_total).astype(np.float32),
+        'item_dense_feats_86': np.log1p(item_total).astype(np.float32),
+        'item_int_feats_89': has_match,
+        'item_int_feats_90': match_count_bucket,
+        'item_dense_feats_91': np.log1p(min_match_delta).astype(np.float32),
+        'item_dense_feats_92': np.log1p(match_count_7d).astype(np.float32),
+        'user_dense_feats_120': time_context,
+        'user_dense_feats_121': domain_summary,
+    }
 
 
 def _compute_raw_fe01_features(
@@ -1371,7 +1584,7 @@ def main() -> None:
             seq_max_lens=seq_max_lens,
             domain_time_buckets=domain_time_buckets,
         )
-        loader_num_workers = num_workers if test_dataset.fast_generated_features else 0
+        loader_num_workers = num_workers if test_dataset.neutral_generated_features else 0
     else:
         # Compatibility path: use pre-generated FE-07 parquet, or opt into
         # materialization with FE07_EVAL_MATERIALIZE=1 for debugging.
