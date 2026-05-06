@@ -38,7 +38,6 @@ from build_fe06_p0ab_dataset import (
     PrefixState as FE06PrefixState,
     _append_or_replace_column as _fe06_append_or_replace_column,
     _compute_generated_features as _fe06_compute_generated_features,
-    _normalize_dense_column as _fe06_normalize_dense_column,
     _shift_sparse_column as _fe06_shift_sparse_column,
 )
 
@@ -76,7 +75,7 @@ _FALLBACK_MODEL_CFG = {
     'rank_mixer_mode': 'full',
     'use_rope': False,
     'rope_base': 10000.0,
-    'emb_skip_threshold': 0,
+    'emb_skip_threshold': 1000000,
     'seq_id_threshold': 10000,
     'ns_tokenizer_type': 'rankmixer',
     'user_ns_tokens': 6,
@@ -560,8 +559,8 @@ def maybe_build_fe06_eval_dataset(
     result_dir: str,
 ) -> str:
     """Materialize FE-06 columns and sparse vocab shift for raw eval parquet."""
-    stats = _load_fe06_stats(model_dir)
-    if stats is None or not _schema_has_fe06_columns(schema_path):
+    schema_expects_fe06 = _schema_has_fe06_columns(schema_path)
+    if not schema_expects_fe06:
         return data_dir
 
     files = _parquet_files(data_dir)
@@ -582,6 +581,16 @@ def maybe_build_fe06_eval_dataset(
         logging.info("Eval parquet already contains FE-06 generated columns; using raw eval directory.")
         logging.info(f"FE-06 eval dataset rows: {input_rows}")
         return data_dir
+
+    stats = _load_fe06_stats(model_dir)
+    if stats is None:
+        raise FileNotFoundError(
+            "Missing FE-06 transform sidecar: fe06_transform_stats.json. "
+            "Put this file next to model.pt in MODEL_OUTPUT_PATH, or set "
+            "FE06_STATS_DIR to the FE-06 preprocessing output directory. "
+            "Raw eval parquet must be transformed with training-time FE-06 "
+            "statistics before dataset.py reads the checkpoint schema."
+        )
 
     dense_stats = stats.get('dense_stats', {})
     count_edges = [int(x) for x in stats.get('match_count_buckets', [0, 1, 2, 4, 8])]

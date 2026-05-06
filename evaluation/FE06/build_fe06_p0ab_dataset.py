@@ -43,6 +43,9 @@ class RunningStats:
     m2: float = 0.0
 
     def update_many(self, values: Iterable[float]) -> None:
+        if isinstance(values, np.ndarray):
+            self.update_array(values)
+            return
         for raw in values:
             value = float(raw)
             if not math.isfinite(value):
@@ -52,6 +55,25 @@ class RunningStats:
             self.mean += delta / self.n
             delta2 = value - self.mean
             self.m2 += delta * delta2
+
+    def update_array(self, values: np.ndarray) -> None:
+        arr = np.asarray(values, dtype=np.float64).ravel()
+        arr = arr[np.isfinite(arr)]
+        batch_n = int(arr.size)
+        if batch_n == 0:
+            return
+        batch_mean = float(arr.mean())
+        batch_m2 = float(np.square(arr - batch_mean).sum())
+        if self.n == 0:
+            self.n = batch_n
+            self.mean = batch_mean
+            self.m2 = batch_m2
+            return
+        total = self.n + batch_n
+        delta = batch_mean - self.mean
+        self.m2 += batch_m2 + delta * delta * self.n * batch_n / total
+        self.mean += delta * batch_n / total
+        self.n = total
 
     @property
     def std(self) -> float:
@@ -130,11 +152,27 @@ def write_json(path: str, obj: Any) -> None:
 def iter_batches(
     row_groups: Sequence[Tuple[str, int]],
     batch_size: int,
+    columns: Optional[Sequence[str]] = None,
 ) -> Iterable[Tuple[str, pa.RecordBatch]]:
+    read_columns = None if columns is None else list(dict.fromkeys(columns))
     for path, rg_idx in row_groups:
         pf = pq.ParquetFile(path)
-        for batch in pf.iter_batches(batch_size=batch_size, row_groups=[rg_idx]):
+        for batch in pf.iter_batches(
+            batch_size=batch_size,
+            row_groups=[rg_idx],
+            columns=read_columns,
+        ):
             yield path, batch
+
+
+def _existing_columns(
+    row_groups: Sequence[Tuple[str, int]],
+    columns: Sequence[str],
+) -> List[str]:
+    if not row_groups:
+        return []
+    available = set(pq.ParquetFile(row_groups[0][0]).schema_arrow.names)
+    return [name for name in dict.fromkeys(columns) if name in available]
 
 
 def column_name(kind: str, fid: int) -> str:
@@ -166,42 +204,70 @@ def _to_float_array(col: pa.Array) -> np.ndarray:
 def _positive_values(col: pa.Array) -> List[int]:
     values: List[int] = []
     if pa.types.is_list(col.type):
-        for row in col.to_pylist():
-            if row is None:
-                continue
-            for x in row:
-                if x is not None and int(x) > 0:
-                    values.append(int(x))
+        if len(col.values) == 0:
+            return values
+        arr = _to_int_array(col.values)
+        positives = arr[arr > 0]
+        values.extend(int(x) for x in positives)
     else:
         arr = _to_int_array(col)
         values.extend(int(x) for x in arr if int(x) > 0)
     return values
 
 
+def _audit_sparse_column(col: pa.Array) -> IntAudit:
+    audit = IntAudit(total_rows=len(col))
+    if pa.types.is_list(col.type):
+        if len(col) == 0:
+            return audit
+        offsets = col.offsets.to_numpy(zero_copy_only=False)
+        values = _to_int_array(col.values) if len(col.values) else np.asarray([], dtype=np.int64)
+        positives = values > 0
+        if positives.any():
+            audit.max_positive = int(values[positives].max())
+            positive_idx = np.flatnonzero(positives)
+            left = np.searchsorted(positive_idx, offsets[:-1], side="left")
+            right = np.searchsorted(positive_idx, offsets[1:], side="left")
+            positive_counts = right - left
+        else:
+            positive_counts = np.zeros(len(col), dtype=np.int64)
+        valid = col.is_valid().to_numpy(zero_copy_only=False)
+        audit.missing_rows = int((~valid | (positive_counts == 0)).sum())
+        return audit
+
+    arr = _to_int_array(col)
+    audit.missing_rows = int((arr <= 0).sum())
+    positives = arr[arr > 0]
+    if positives.size:
+        audit.max_positive = int(positives.max())
+    return audit
+
+
 def _missing_rows(col: pa.Array) -> int:
     if pa.types.is_list(col.type):
+        if len(col) == 0:
+            return 0
+        offsets = col.offsets.to_numpy(zero_copy_only=False)
+        values = _to_int_array(col.values) if len(col.values) else np.asarray([], dtype=np.int64)
+        positives = values > 0
+        valid = col.is_valid().to_numpy(zero_copy_only=False)
         missing = 0
-        for row in col.to_pylist():
-            if row is None or not any(x is not None and int(x) > 0 for x in row):
+        for i in range(len(col)):
+            if not bool(valid[i]) or not positives[offsets[i]:offsets[i + 1]].any():
                 missing += 1
         return missing
     arr = _to_int_array(col)
     return int((arr <= 0).sum())
 
 
-def _dense_values(col: pa.Array) -> List[float]:
-    out: List[float] = []
+def _dense_values(col: pa.Array) -> np.ndarray:
     if pa.types.is_list(col.type):
-        for row in col.to_pylist():
-            if row is None:
-                continue
-            for x in row:
-                if x is not None and math.isfinite(float(x)):
-                    out.append(float(x))
+        if len(col.values) == 0:
+            return np.asarray([], dtype=np.float32)
+        arr = _to_float_array(col.values)
     else:
         arr = _to_float_array(col)
-        out.extend(float(x) for x in arr if math.isfinite(float(x)))
-    return out
+    return arr[np.isfinite(arr)]
 
 
 def _first_scalar_from_maybe_list(values: Iterable[Any]) -> np.ndarray:
@@ -284,24 +350,10 @@ def _seq_timestamp_columns(schema: Dict[str, Any]) -> Dict[str, str]:
     return out
 
 
-def _collect_audit_and_min_ts(
+def _collect_label_time_diagnostics(
     row_groups: Sequence[Tuple[str, int]],
-    schema: Dict[str, Any],
     batch_size: int,
-) -> Tuple[Dict[str, IntAudit], Dict[str, Any]]:
-    audits: Dict[str, IntAudit] = {}
-    for fid, _, _ in schema.get("user_int", []):
-        audits[column_name("user_int", int(fid))] = IntAudit()
-    for fid, _, _ in schema.get("item_int", []):
-        audits[column_name("item_int", int(fid))] = IntAudit()
-    for domain, cfg in schema.get("seq", {}).items():
-        prefix = _strip_prefix(str(cfg.get("prefix", "")))
-        ts_fid = cfg.get("ts_fid")
-        for fid, _ in cfg.get("features", []):
-            if int(fid) == int(ts_fid):
-                continue
-            audits[f"{prefix}_{int(fid)}"] = IntAudit()
-
+) -> Dict[str, Any]:
     label_counts: Counter[int] = Counter()
     total_rows = 0
     pos = 0
@@ -312,7 +364,8 @@ def _collect_audit_and_min_ts(
     lt_max: Optional[int] = None
     lt_observed = 0
 
-    for _, batch in iter_batches(row_groups, batch_size):
+    columns = _existing_columns(row_groups, ["label_type", "timestamp", "label_time"])
+    for _, batch in iter_batches(row_groups, batch_size, columns=columns):
         names = batch.schema.names
         idx = {name: i for i, name in enumerate(names)}
         B = batch.num_rows
@@ -342,17 +395,7 @@ def _collect_audit_and_min_ts(
                 lt_min = cur_min if lt_min is None else min(lt_min, cur_min)
                 lt_max = cur_max if lt_max is None else max(lt_max, cur_max)
 
-        for name, audit in audits.items():
-            if name not in idx:
-                continue
-            col = batch.column(idx[name])
-            positives = _positive_values(col)
-            audit.total_rows += B
-            audit.missing_rows += _missing_rows(col)
-            if positives:
-                audit.max_positive = max(audit.max_positive, max(positives))
-
-    diagnostics = {
+    return {
         "rows": total_rows,
         "positive_label_type_2": pos,
         "negative_not_label_type_2": neg,
@@ -363,7 +406,33 @@ def _collect_audit_and_min_ts(
         "label_time_max": lt_max,
         "label_time_observed_rows": lt_observed,
     }
-    return audits, diagnostics
+
+
+def _collect_user_int_audit(
+    row_groups: Sequence[Tuple[str, int]],
+    schema: Dict[str, Any],
+    batch_size: int,
+) -> Dict[str, IntAudit]:
+    user_names = [column_name("user_int", int(fid)) for fid, _, _ in schema.get("user_int", [])]
+    read_columns = _existing_columns(row_groups, user_names)
+    audits = {name: IntAudit() for name in user_names}
+    if not read_columns:
+        return audits
+
+    for processed, (_, batch) in enumerate(iter_batches(row_groups, batch_size, columns=read_columns), start=1):
+        names = batch.schema.names
+        idx = {name: i for i, name in enumerate(names)}
+        for name in user_names:
+            if name not in idx:
+                continue
+            cur = _audit_sparse_column(batch.column(idx[name]))
+            audit = audits[name]
+            audit.total_rows += cur.total_rows
+            audit.missing_rows += cur.missing_rows
+            audit.max_positive = max(audit.max_positive, cur.max_positive)
+        if processed % 100 == 0:
+            print(f"[FE-06] user_int audit progress: {processed}/{len(row_groups)} row groups", flush=True)
+    return audits
 
 
 def _shift_int_values_array(values: np.ndarray) -> np.ndarray:
@@ -376,6 +445,13 @@ def _shift_int_values_array(values: np.ndarray) -> np.ndarray:
 
 def _shift_sparse_column(col: pa.Array, is_sequence: bool = False) -> pa.Array:
     if pa.types.is_list(col.type):
+        if is_sequence and col.null_count == 0:
+            values = _to_int_array(col.values) if len(col.values) else np.asarray([], dtype=np.int64)
+            shifted = _shift_int_values_array(values)
+            return pa.ListArray.from_arrays(
+                col.offsets,
+                pa.array(shifted, type=pa.int64()),
+            )
         shifted_rows: List[List[int]] = []
         for row in col.to_pylist():
             if row is None:
@@ -398,6 +474,14 @@ def _shift_sparse_column(col: pa.Array, is_sequence: bool = False) -> pa.Array:
 def _normalize_dense_column(col: pa.Array, name: str, stats: Dict[str, RunningStats]) -> pa.Array:
     tracker = stats[name]
     if pa.types.is_list(col.type):
+        if col.null_count == 0:
+            values = _to_float_array(col.values) if len(col.values) else np.asarray([], dtype=np.float32)
+            values = np.nan_to_num(values, nan=tracker.mean, posinf=tracker.mean, neginf=tracker.mean)
+            normalized = ((values - tracker.mean) / tracker.std).astype(np.float32)
+            return pa.ListArray.from_arrays(
+                col.offsets,
+                pa.array(normalized, type=pa.float32()),
+            )
         rows: List[List[float]] = []
         for row in col.to_pylist():
             if row is None:
@@ -543,8 +627,22 @@ def _fit_dense_stats(
     for name in _generated_dense_names():
         stats[name] = RunningStats()
 
+    needed_columns = [
+        "user_id",
+        "item_id",
+        "timestamp",
+        "item_int_feats_9",
+        match_col,
+        match_ts_col,
+        *_dense_feature_names(schema),
+        *seq_ts_cols.values(),
+    ]
+    read_columns = _existing_columns(row_groups, needed_columns)
     state = PrefixState()
-    for _, batch in iter_batches(row_groups, batch_size):
+    for processed, (_, batch) in enumerate(
+        iter_batches(row_groups, batch_size, columns=read_columns),
+        start=1,
+    ):
         names = batch.schema.names
         idx = {name: i for i, name in enumerate(names)}
         for name in _dense_feature_names(schema):
@@ -562,6 +660,8 @@ def _fit_dense_stats(
         )
         for name in _generated_dense_names():
             stats[name].update_many(feats[name].ravel())
+        if processed % 100 == 0:
+            print(f"[FE-06] dense stats progress: {processed}/{len(row_groups)} row groups", flush=True)
     return stats
 
 
@@ -686,7 +786,7 @@ def _write_augmented_parquet(
     state = PrefixState()
     writers: Dict[str, pq.ParquetWriter] = {}
     try:
-        for input_path, batch in iter_batches(row_groups, batch_size):
+        for processed, (input_path, batch) in enumerate(iter_batches(row_groups, batch_size), start=1):
             names = batch.schema.names
             idx = {name: i for i, name in enumerate(names)}
             table = pa.Table.from_batches([batch])
@@ -746,6 +846,8 @@ def _write_augmented_parquet(
                 writer = pq.ParquetWriter(out_path, table.schema, compression="snappy")
                 writers[out_path] = writer
             writer.write_table(table)
+            if processed % 100 == 0:
+                print(f"[FE-06] write progress: {processed}/{len(row_groups)} row groups", flush=True)
     finally:
         for writer in writers.values():
             writer.close()
@@ -791,9 +893,9 @@ def main() -> None:
     print(f"[FE-06] input parquet files: {len(files)}")
     print(f"[FE-06] input row groups: {len(row_groups)}; fitting stats on first {len(fit_row_groups)}")
     print(f"[FE-06] match columns: {match_col}, {match_ts_col}")
-    print("[FE-06] collecting sparse audit and label/time diagnostics...")
-    audits, diagnostics = _collect_audit_and_min_ts(row_groups, schema, args.batch_size)
-    fit_audits, fit_diagnostics = _collect_audit_and_min_ts(fit_row_groups, schema, args.batch_size)
+    print("[FE-06] collecting label/time diagnostics...")
+    diagnostics = _collect_label_time_diagnostics(row_groups, args.batch_size)
+    fit_diagnostics = _collect_label_time_diagnostics(fit_row_groups, args.batch_size)
     min_timestamp = int(fit_diagnostics["timestamp_min"] or diagnostics["timestamp_min"] or 0)
 
     print(
@@ -814,6 +916,9 @@ def main() -> None:
         )
     else:
         print("[FE-06] label_time: not present or no positive label_time values")
+
+    print("[FE-06] collecting high-missing user_int audit...")
+    fit_audits = _collect_user_int_audit(fit_row_groups, schema, args.batch_size)
 
     print("[FE-06] fitting dense normalization stats...")
     dense_stats = _fit_dense_stats(

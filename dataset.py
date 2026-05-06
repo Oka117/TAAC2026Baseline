@@ -23,7 +23,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.multiprocessing
 from torch.utils.data import IterableDataset, DataLoader
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 # numpy.typing is available since numpy >= 1.20; on older numpy fall back to a
 # no-op shim so that forward-referenced annotations like ``npt.NDArray[np.int64]``
