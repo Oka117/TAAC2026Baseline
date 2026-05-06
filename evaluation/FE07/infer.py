@@ -30,7 +30,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from dataset import (
     FeatureSchema,
@@ -212,6 +212,285 @@ def _schema_required_parquet_columns(schema_path: str) -> List[str]:
         for fid, _ in cfg.get('features', []):
             columns.append(f'{prefix}_{int(fid)}')
     return list(dict.fromkeys(columns))
+
+
+def _fe07_expected_generated_columns() -> List[str]:
+    return [
+        'user_dense_feats_110',
+        'user_dense_feats_120',
+        'user_dense_feats_121',
+        'item_dense_feats_86',
+        'item_dense_feats_91',
+        'item_dense_feats_92',
+        'item_int_feats_89',
+        'item_int_feats_90',
+    ]
+
+
+def _eval_has_fe07_generated_columns(data_dir: str) -> bool:
+    files = _parquet_files(data_dir)
+    first_names = pq.ParquetFile(files[0]).schema_arrow.names
+    return all(name in first_names for name in _fe07_expected_generated_columns())
+
+
+def _rebuild_dataset_column_plans(
+    dataset: PCVRParquetDataset,
+    schema_names: Sequence[str],
+) -> None:
+    dataset._col_idx = {name: i for i, name in enumerate(schema_names)}
+
+    dataset._user_int_plan = []
+    offset = 0
+    for fid, vs, dim in dataset._user_int_cols:
+        name = f'user_int_feats_{fid}'
+        ci = dataset._col_idx.get(name)
+        if ci is None:
+            raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+        dataset._user_int_plan.append((ci, dim, offset, vs))
+        offset += dim
+
+    dataset._item_int_plan = []
+    offset = 0
+    for fid, vs, dim in dataset._item_int_cols:
+        name = f'item_int_feats_{fid}'
+        ci = dataset._col_idx.get(name)
+        if ci is None:
+            raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+        dataset._item_int_plan.append((ci, dim, offset, vs))
+        offset += dim
+
+    dataset._user_dense_plan = []
+    offset = 0
+    for fid, dim in dataset._user_dense_cols:
+        name = f'user_dense_feats_{fid}'
+        ci = dataset._col_idx.get(name)
+        if ci is None:
+            raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+        dataset._user_dense_plan.append((ci, dim, offset))
+        offset += dim
+
+    dataset._item_dense_plan = []
+    offset = 0
+    for fid, dim in dataset._item_dense_cols:
+        name = f'item_dense_feats_{fid}'
+        ci = dataset._col_idx.get(name)
+        if ci is None:
+            raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+        dataset._item_dense_plan.append((ci, dim, offset))
+        offset += dim
+
+    dataset._seq_plan = {}
+    for domain in dataset.seq_domains:
+        prefix = dataset._seq_prefix[domain]
+        side_plan = []
+        for slot, fid in enumerate(dataset.sideinfo_fids[domain]):
+            name = f'{prefix}_{fid}'
+            ci = dataset._col_idx.get(name)
+            if ci is None:
+                raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+            vs = dataset.seq_vocab_sizes[domain][fid]
+            side_plan.append((ci, slot, vs))
+        ts_fid = dataset.ts_fids[domain]
+        ts_ci = None
+        if ts_fid is not None:
+            name = f'{prefix}_{ts_fid}'
+            ts_ci = dataset._col_idx.get(name)
+            if ts_ci is None:
+                raise KeyError(f"FE-07 eval dataset missing required column: {name}")
+        dataset._seq_plan[domain] = (side_plan, ts_ci)
+
+
+def _slice_batch_dict(batch: Dict[str, Any], start: int, end: int) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            out[key] = value[start:end]
+        elif key == 'user_id':
+            out[key] = value[start:end]
+        else:
+            out[key] = value
+    return out
+
+
+class FE07OnTheFlyEvalDataset(IterableDataset):
+    """Generate FE-07 eval features in memory and feed tensors directly."""
+
+    def __init__(
+        self,
+        data_dir: str,
+        schema_path: str,
+        model_dir: str,
+        infer_batch_size: int,
+        transform_batch_size: int,
+        seq_max_lens: Dict[str, int],
+        domain_time_buckets: Optional[Dict[str, Sequence[int]]],
+    ) -> None:
+        super().__init__()
+        self.files = _parquet_files(data_dir)
+        self.schema_path = schema_path
+        self.infer_batch_size = infer_batch_size
+        self.transform_batch_size = transform_batch_size
+        logging.info(
+            "Using FE-07 on-the-fly eval transform: "
+            f"transform_batch_size={transform_batch_size}, "
+            f"infer_batch_size={infer_batch_size}")
+
+        stats = _load_fe07_stats(model_dir)
+        if stats is None:
+            raise FileNotFoundError(
+                "Checkpoint schema requires FE-07 generated columns, but "
+                "fe07_transform_stats.json was not found next to model.pt."
+            )
+        self.stats = stats
+        self.dense_stats = stats.get('dense_stats', {})
+        self.count_edges = [int(x) for x in stats.get('match_count_buckets', [0, 1, 2, 4, 8])]
+        self.match_col = str(stats.get('match_col', 'domain_d_seq_19'))
+        self.match_ts_col = str(stats.get('match_ts_col', 'domain_d_seq_26'))
+        self.seq_ts_cols = {str(k): str(v) for k, v in stats.get('seq_time_columns', {}).items()}
+        self.min_timestamp = int(stats.get('min_timestamp_for_day_since', 0))
+        self.match_window_seconds = int(stats.get('match_window_days', 7)) * 86400
+        self.int_fill_audit = stats.get('int_fill_audit', {})
+        self.fill_empty_int_lists = bool(stats.get('fill_empty_int_lists', False))
+
+        first_names = pq.ParquetFile(self.files[0]).schema_arrow.names
+        missing_base = [
+            name for name in ('user_id', 'item_id', 'timestamp', 'item_int_feats_9', self.match_col, self.match_ts_col)
+            if name not in first_names
+        ]
+        if missing_base:
+            raise KeyError("FE-07 eval transform missing required raw columns: " + ", ".join(missing_base))
+
+        self.required_output = _schema_required_parquet_columns(schema_path)
+        self.required_set = set(self.required_output)
+        self.generated = set(_fe07_expected_generated_columns())
+        required_raw_output = [
+            name for name in self.required_output
+            if name in first_names and name not in self.generated
+        ]
+        read_columns = set(required_raw_output)
+        read_columns.update(['user_id', 'item_id', 'timestamp', 'item_int_feats_9', self.match_col, self.match_ts_col])
+        read_columns.update(self.seq_ts_cols.values())
+        read_columns.update(
+            name for name in self.int_fill_audit
+            if name in first_names and (name.startswith('user_int_feats_') or name.startswith('item_int_feats_'))
+        )
+        read_columns.update(
+            name for name in self.dense_stats
+            if name in first_names and name not in self.generated
+        )
+        self.read_columns = [name for name in first_names if name in read_columns]
+
+        self.converter = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=transform_batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            is_training=False,
+            domain_time_buckets=domain_time_buckets,
+        )
+        _rebuild_dataset_column_plans(self.converter, self.required_output)
+
+        self.num_rows = self.converter.num_rows
+        self.num_time_buckets = self.converter.num_time_buckets
+        self.seq_domains = self.converter.seq_domains
+        self.user_int_schema = self.converter.user_int_schema
+        self.user_int_vocab_sizes = self.converter.user_int_vocab_sizes
+        self.item_int_schema = self.converter.item_int_schema
+        self.item_int_vocab_sizes = self.converter.item_int_vocab_sizes
+        self.user_dense_schema = self.converter.user_dense_schema
+        self.item_dense_schema = self.converter.item_dense_schema
+        self.seq_domain_vocab_sizes = self.converter.seq_domain_vocab_sizes
+
+    def _transform_batch(self, batch: pa.RecordBatch, state: FE07PrefixState) -> pa.RecordBatch:
+        idx = {name: i for i, name in enumerate(batch.schema.names)}
+        input_table = pa.Table.from_batches([batch])
+        table = input_table.select([
+            name for name in input_table.schema.names
+            if name in self.required_set and name not in self.generated
+        ])
+
+        for name, audit in self.int_fill_audit.items():
+            if name in idx and name in self.required_set and (
+                name.startswith('user_int_feats_') or name.startswith('item_int_feats_')
+            ):
+                fill_value = int(audit.get('fill_value', 0))
+                table = _fe07_append_or_replace_column(
+                    table,
+                    name,
+                    _fe07_fill_int_column(batch.column(idx[name]), fill_value, self.fill_empty_int_lists),
+                )
+
+        for name in self.dense_stats:
+            if name in idx and name in self.required_set and name not in self.generated:
+                table = _fe07_append_or_replace_column(
+                    table,
+                    name,
+                    _normalize_fe07_dense_column(batch.column(idx[name]), name, self.dense_stats),
+                )
+
+        feats = _fe07_compute_generated_features(
+            batch,
+            state,
+            self.match_col,
+            self.match_ts_col,
+            self.seq_ts_cols,
+            self.min_timestamp,
+            self.match_window_seconds,
+            self.count_edges,
+        )
+
+        for name in [
+            'user_dense_feats_110',
+            'user_dense_feats_120',
+            'user_dense_feats_121',
+            'item_dense_feats_86',
+            'item_dense_feats_91',
+            'item_dense_feats_92',
+        ]:
+            if name not in self.required_set:
+                continue
+            values = _normalize_fe07_array(name, feats[name], self.dense_stats)
+            if values.ndim == 1:
+                arr = pa.array(values, type=pa.float32())
+            else:
+                arr = pa.array(values.tolist(), type=pa.list_(pa.float32()))
+            table = _fe07_append_or_replace_column(table, name, arr)
+
+        for name in ['item_int_feats_89', 'item_int_feats_90']:
+            if name in self.required_set:
+                table = _fe07_append_or_replace_column(
+                    table, name, pa.array(feats[name], type=pa.int64()))
+
+        missing_output = [name for name in self.required_output if name not in table.schema.names]
+        if missing_output:
+            raise KeyError(
+                "FE-07 on-the-fly eval could not materialize required columns: "
+                + ", ".join(missing_output[:20])
+            )
+        return table.select(self.required_output).to_batches()[0]
+
+    def __iter__(self) -> Iterable[Dict[str, Any]]:
+        state = FE07PrefixState()
+        processed_rows = 0
+        processed_batches = 0
+        for _path, raw_batch in _iter_batches(
+            self.files,
+            self.transform_batch_size,
+            columns=self.read_columns,
+        ):
+            transformed = self._transform_batch(raw_batch, state)
+            tensor_batch = self.converter._convert_batch(transformed)
+            B = transformed.num_rows
+            processed_rows += B
+            processed_batches += 1
+            if processed_batches == 1 or processed_batches % 100 == 0:
+                logging.info(
+                    f"FE-07 on-the-fly eval transformed {processed_rows} rows "
+                    f"({processed_batches} batches)")
+            for start in range(0, B, self.infer_batch_size):
+                yield _slice_batch_dict(tensor_batch, start, min(start + self.infer_batch_size, B))
 
 
 def _strip_prefix(prefix: str) -> str:
@@ -1000,17 +1279,6 @@ def main() -> None:
     batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
-    # ---- FE-07 transform-only preprocessing for raw eval data ----
-    # FE-07 checkpoints expect FE00-literal transforms plus generated
-    # P0/FE01AB columns. Materialize them before dataset.py reads schema.json.
-    data_dir = maybe_build_fe07_eval_dataset(
-        data_dir=data_dir,
-        schema_path=schema_path,
-        model_dir=model_dir,
-        batch_size=batch_size,
-        result_dir=result_dir,
-    )
-
     domain_bucket_path = train_config.get('domain_bucket_path')
     if domain_bucket_path:
         local_candidate = os.path.join(model_dir, os.path.basename(domain_bucket_path))
@@ -1029,16 +1297,44 @@ def main() -> None:
         domain_time_buckets = load_domain_time_bucket_boundaries(domain_bucket_path)
         logging.info(f"Loaded FE-07 domain time buckets from {domain_bucket_path}")
 
-    test_dataset = PCVRParquetDataset(
-        parquet_path=data_dir,
-        schema_path=schema_path,
-        batch_size=batch_size,
-        seq_max_lens=seq_max_lens,
-        shuffle=False,
-        buffer_batches=0,
-        is_training=False,
-        domain_time_buckets=domain_time_buckets,
-    )
+    schema_has_fe07 = _schema_has_fe07_columns(schema_path)
+    eval_has_fe07 = _eval_has_fe07_generated_columns(data_dir) if schema_has_fe07 else False
+    force_materialize = os.environ.get('FE07_EVAL_MATERIALIZE', '').lower() in {'1', 'true', 'yes'}
+    use_on_the_fly_fe07 = schema_has_fe07 and not eval_has_fe07 and not force_materialize
+
+    if use_on_the_fly_fe07:
+        transform_batch_size = int(os.environ.get('FE07_EVAL_TRANSFORM_BATCH_SIZE', 1024))
+        test_dataset = FE07OnTheFlyEvalDataset(
+            data_dir=data_dir,
+            schema_path=schema_path,
+            model_dir=model_dir,
+            infer_batch_size=batch_size,
+            transform_batch_size=transform_batch_size,
+            seq_max_lens=seq_max_lens,
+            domain_time_buckets=domain_time_buckets,
+        )
+        loader_num_workers = 0
+    else:
+        # Compatibility path: use pre-generated FE-07 parquet, or opt into
+        # materialization with FE07_EVAL_MATERIALIZE=1 for debugging.
+        data_dir = maybe_build_fe07_eval_dataset(
+            data_dir=data_dir,
+            schema_path=schema_path,
+            model_dir=model_dir,
+            batch_size=batch_size,
+            result_dir=result_dir,
+        )
+        test_dataset = PCVRParquetDataset(
+            parquet_path=data_dir,
+            schema_path=schema_path,
+            batch_size=batch_size,
+            seq_max_lens=seq_max_lens,
+            shuffle=False,
+            buffer_batches=0,
+            is_training=False,
+            domain_time_buckets=domain_time_buckets,
+        )
+        loader_num_workers = num_workers
     total_test_samples = test_dataset.num_rows
     logging.info(f"Total test samples: {total_test_samples}")
 
@@ -1086,13 +1382,14 @@ def main() -> None:
     model.eval()
     logging.info("Model loaded successfully")
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=None,
-        num_workers=num_workers,
-        prefetch_factor=2,
-        pin_memory=torch.cuda.is_available(),
-    )
+    loader_kwargs: Dict[str, Any] = {
+        'batch_size': None,
+        'num_workers': loader_num_workers,
+        'pin_memory': torch.cuda.is_available(),
+    }
+    if loader_num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 2
+    test_loader = DataLoader(test_dataset, **loader_kwargs)
 
     all_probs = []
     all_user_ids = []
