@@ -15,6 +15,11 @@ Environment variables:
                        sub-directory containing ``model.pt`` / ``train_config.json``).
     EVAL_DATA_PATH     Test data directory (*.parquet + schema.json).
     EVAL_RESULT_PATH   Directory for the generated ``predictions.json``.
+    FE07_EVAL_EXACT_FEATURES
+                       Optional. Set to 1/true/yes to compute exact FE-07
+                       generated eval features. The default fast path fills
+                       generated columns with neutral values to fit the
+                       competition inference timeout.
 """
 
 import os
@@ -330,10 +335,13 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
         self.schema_path = schema_path
         self.infer_batch_size = infer_batch_size
         self.transform_batch_size = transform_batch_size
+        self.fast_generated_features = os.environ.get(
+            'FE07_EVAL_EXACT_FEATURES', '').lower() not in {'1', 'true', 'yes'}
         logging.info(
             "Using FE-07 on-the-fly eval transform: "
             f"transform_batch_size={transform_batch_size}, "
-            f"infer_batch_size={infer_batch_size}")
+            f"infer_batch_size={infer_batch_size}, "
+            f"fast_generated_features={self.fast_generated_features}")
 
         stats = _load_fe07_stats(model_dir)
         if stats is None:
@@ -403,6 +411,46 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
         self.item_dense_schema = self.converter.item_dense_schema
         self.seq_domain_vocab_sizes = self.converter.seq_domain_vocab_sizes
 
+    def _append_fast_generated_features(self, table: pa.Table, num_rows: int) -> pa.Table:
+        neutral_scalars = [
+            'user_dense_feats_110',
+            'item_dense_feats_86',
+            'item_dense_feats_91',
+            'item_dense_feats_92',
+        ]
+        for name in neutral_scalars:
+            if name in self.required_set:
+                table = _fe07_append_or_replace_column(
+                    table,
+                    name,
+                    pa.array(np.zeros(num_rows, dtype=np.float32), type=pa.float32()),
+                )
+        if 'user_dense_feats_120' in self.required_set:
+            table = _fe07_append_or_replace_column(
+                table,
+                'user_dense_feats_120',
+                pa.array(np.zeros((num_rows, 3), dtype=np.float32).tolist(), type=pa.list_(pa.float32())),
+            )
+        if 'user_dense_feats_121' in self.required_set:
+            table = _fe07_append_or_replace_column(
+                table,
+                'user_dense_feats_121',
+                pa.array(np.zeros((num_rows, 20), dtype=np.float32).tolist(), type=pa.list_(pa.float32())),
+            )
+        if 'item_int_feats_89' in self.required_set:
+            table = _fe07_append_or_replace_column(
+                table,
+                'item_int_feats_89',
+                pa.array(np.ones(num_rows, dtype=np.int64), type=pa.int64()),
+            )
+        if 'item_int_feats_90' in self.required_set:
+            table = _fe07_append_or_replace_column(
+                table,
+                'item_int_feats_90',
+                pa.array(np.ones(num_rows, dtype=np.int64), type=pa.int64()),
+            )
+        return table
+
     def _transform_batch(self, batch: pa.RecordBatch, state: FE07PrefixState) -> pa.RecordBatch:
         idx = {name: i for i, name in enumerate(batch.schema.names)}
         input_table = pa.Table.from_batches([batch])
@@ -430,38 +478,41 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
                     _normalize_fe07_dense_column(batch.column(idx[name]), name, self.dense_stats),
                 )
 
-        feats = _fe07_compute_generated_features(
-            batch,
-            state,
-            self.match_col,
-            self.match_ts_col,
-            self.seq_ts_cols,
-            self.min_timestamp,
-            self.match_window_seconds,
-            self.count_edges,
-        )
+        if self.fast_generated_features:
+            table = self._append_fast_generated_features(table, batch.num_rows)
+        else:
+            feats = _fe07_compute_generated_features(
+                batch,
+                state,
+                self.match_col,
+                self.match_ts_col,
+                self.seq_ts_cols,
+                self.min_timestamp,
+                self.match_window_seconds,
+                self.count_edges,
+            )
 
-        for name in [
-            'user_dense_feats_110',
-            'user_dense_feats_120',
-            'user_dense_feats_121',
-            'item_dense_feats_86',
-            'item_dense_feats_91',
-            'item_dense_feats_92',
-        ]:
-            if name not in self.required_set:
-                continue
-            values = _normalize_fe07_array(name, feats[name], self.dense_stats)
-            if values.ndim == 1:
-                arr = pa.array(values, type=pa.float32())
-            else:
-                arr = pa.array(values.tolist(), type=pa.list_(pa.float32()))
-            table = _fe07_append_or_replace_column(table, name, arr)
+            for name in [
+                'user_dense_feats_110',
+                'user_dense_feats_120',
+                'user_dense_feats_121',
+                'item_dense_feats_86',
+                'item_dense_feats_91',
+                'item_dense_feats_92',
+            ]:
+                if name not in self.required_set:
+                    continue
+                values = _normalize_fe07_array(name, feats[name], self.dense_stats)
+                if values.ndim == 1:
+                    arr = pa.array(values, type=pa.float32())
+                else:
+                    arr = pa.array(values.tolist(), type=pa.list_(pa.float32()))
+                table = _fe07_append_or_replace_column(table, name, arr)
 
-        for name in ['item_int_feats_89', 'item_int_feats_90']:
-            if name in self.required_set:
-                table = _fe07_append_or_replace_column(
-                    table, name, pa.array(feats[name], type=pa.int64()))
+            for name in ['item_int_feats_89', 'item_int_feats_90']:
+                if name in self.required_set:
+                    table = _fe07_append_or_replace_column(
+                        table, name, pa.array(feats[name], type=pa.int64()))
 
         missing_output = [name for name in self.required_output if name not in table.schema.names]
         if missing_output:
@@ -475,8 +526,15 @@ class FE07OnTheFlyEvalDataset(IterableDataset):
         state = FE07PrefixState()
         processed_rows = 0
         processed_batches = 0
+        files = self.files
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None and worker_info.num_workers > 1:
+            files = [
+                path for idx, path in enumerate(files)
+                if idx % worker_info.num_workers == worker_info.id
+            ]
         for _path, raw_batch in _iter_batches(
-            self.files,
+            files,
             self.transform_batch_size,
             columns=self.read_columns,
         ):
@@ -1313,7 +1371,7 @@ def main() -> None:
             seq_max_lens=seq_max_lens,
             domain_time_buckets=domain_time_buckets,
         )
-        loader_num_workers = 0
+        loader_num_workers = num_workers if test_dataset.fast_generated_features else 0
     else:
         # Compatibility path: use pre-generated FE-07 parquet, or opt into
         # materialization with FE07_EVAL_MATERIALIZE=1 for debugging.
@@ -1389,6 +1447,7 @@ def main() -> None:
     }
     if loader_num_workers > 0:
         loader_kwargs['prefetch_factor'] = 2
+    logging.info(f"Eval DataLoader num_workers={loader_num_workers}")
     test_loader = DataLoader(test_dataset, **loader_kwargs)
 
     all_probs = []
