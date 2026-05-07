@@ -166,6 +166,10 @@ class PCVRHyFormerRankingTrainer:
                 'feature_engineering_stats.json',
                 'fe06_transform_stats.json',
                 'fe07_transform_stats.json',
+                'fe08_transform_stats.json',
+                'fe08_dense_normalization_stats.json',
+                'dropped_feats.may7.json',
+                'ns_groups.may7.json',
                 'domain_time_bucket_boundaries.json',
                 'docx_alignment.fe01.json',
                 'docx_alignment.fe01a.json',
@@ -173,6 +177,7 @@ class PCVRHyFormerRankingTrainer:
                 'docx_alignment.fe02.json',
                 'docx_alignment.fe06.json',
                 'docx_alignment.fe07.json',
+                'docx_alignment.fe08.json',
             ):
                 sidecar_path = os.path.join(schema_dir, sidecar_name)
                 if os.path.exists(sidecar_path):

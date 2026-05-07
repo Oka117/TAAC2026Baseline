@@ -19,6 +19,10 @@
 | `FE07_P012_DOMAIN_DOCX/README.md` | FE-07 P0/P1/P2-Domain 强对齐方案索引 |
 | `FE07_P012_DOMAIN_DOCX/experiment_07_fe00_01ab_claude_p012_domain_docx_alignment_plan.zh.md` | FE00 + 01AB + Claude P0/P1/P2-Domain 与上传 DOCX 的强关联实验方案 |
 | `FE07_P012_DOMAIN_DOCX/experiment_07_strong_check_and_prediction.zh.md` | FE-07 强力检查、模块级提分点和实验结果预测 |
+| `FE08_MAY7_GNN/README.md` | FE-08 May7 GNN 强对齐方案索引 |
+| `FE08_MAY7_GNN/experiment_08_may7_gnn_feature_alignment_plan.zh.md` | 严格按 Claude 5 月 7 日 FE08 方案整理的 GNN + 验证特征主实验方案 |
+| `FE08_MAY7_GNN/experiment_08_strong_check_and_prediction.zh.md` | FE-08 强力检查、代码就绪度、模块级预测和回滚规则 |
+| `FE08_MAY7_GNN/experiment_08_claude_alignment_audit.zh.md` | FE-08 与 Claude 5 月 7 日方案逐项对齐审计和对应联系点 |
 | `feature_engineering_design_alignment_audit.zh.md` | 上传 DOCX 与实验计划逐条对齐审计 |
 | `baseline_feature_engineering_modification_plan.zh.md` | 总体 baseline 修改方向 |
 | `experiment_03_delay_weighted_loss_plan.zh.md` | FE-03 delay-aware weighted loss 方案 |
@@ -35,6 +39,7 @@ FE-01A total frequency only ablation
 FE-01B target-history match only ablation
 FE-02 historical delay features
 FE-07 FE00 + 01AB + Claude P0/P1/P2-Domain strong DOCX alignment
+FE-08 May7 GNN + verified feature return path
 FE-03 delay-aware weighted loss
 FE-04 multi-task conversion + delay bucket + engagement
 ```

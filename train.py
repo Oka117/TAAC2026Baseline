@@ -247,6 +247,12 @@ def main() -> None:
     set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
+    if args.seq_top_k > 0 and args.seq_encoder_type != 'longer':
+        logging.warning(
+            f"--seq_top_k={args.seq_top_k} is set but seq_encoder_type="
+            f"{args.seq_encoder_type}; this flag is a no-op unless "
+            "--seq_encoder_type=longer is used."
+        )
 
     from torch.utils.tensorboard import SummaryWriter
     writer = SummaryWriter(args.tf_events_dir)
@@ -313,6 +319,27 @@ def main() -> None:
         pcvr_dataset.user_int_schema, pcvr_dataset.user_int_vocab_sizes)
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
+
+    if args.ns_tokenizer_type == 'rankmixer':
+        expected_user_ns = args.user_ns_tokens if args.user_ns_tokens > 0 else len(user_ns_groups)
+        expected_item_ns = args.item_ns_tokens if args.item_ns_tokens > 0 else len(item_ns_groups)
+    else:
+        expected_user_ns = len(user_ns_groups)
+        expected_item_ns = len(item_ns_groups)
+    expected_num_ns = (
+        expected_user_ns
+        + (1 if pcvr_dataset.user_dense_schema.total_dim > 0 else 0)
+        + expected_item_ns
+        + (1 if pcvr_dataset.item_dense_schema.total_dim > 0 else 0)
+    )
+    expected_T = args.num_queries * len(pcvr_dataset.seq_domains) + expected_num_ns
+    if args.rank_mixer_mode == 'full' and args.d_model % expected_T != 0:
+        raise ValueError(
+            f"FATAL: d_model={args.d_model} must be divisible by "
+            f"T=num_queries*num_sequences+num_ns="
+            f"{args.num_queries}*{len(pcvr_dataset.seq_domains)}+{expected_num_ns}={expected_T} "
+            "when rank_mixer_mode=full."
+        )
 
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
