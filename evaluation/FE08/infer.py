@@ -43,6 +43,7 @@ from build_fe08_may7_dataset import (
     _append_or_replace_column as _fe08_append_or_replace_column,
     _compute_generated_features as _fe08_compute_generated_features,
     _fill_int_column as _fe08_fill_int_column,
+    _sequence_columns as _fe08_sequence_columns,
     _sort_sequence_columns_by_recency as _fe08_sort_sequence_columns_by_recency,
 )
 
@@ -288,6 +289,28 @@ class FE08OnTheFlyEvalDataset(IterableDataset):
             f"transform_batch_size={transform_batch_size}, "
             f"infer_batch_size={infer_batch_size}, "
             "exact_generated_features=True")
+        default_convert_batch_rows = min(transform_batch_size, 4096)
+        requested_convert_batch_rows = int(os.environ.get(
+            'FE08_EVAL_CONVERT_BATCH_ROWS',
+            default_convert_batch_rows,
+        ))
+        if requested_convert_batch_rows <= 0:
+            raise ValueError(
+                "FE08_EVAL_CONVERT_BATCH_ROWS must be a positive integer; "
+                f"got {requested_convert_batch_rows}."
+            )
+        self.convert_batch_rows = min(
+            transform_batch_size,
+            max(infer_batch_size, min(transform_batch_size, requested_convert_batch_rows)),
+        )
+        if self.convert_batch_rows != requested_convert_batch_rows:
+            logging.info(
+                "FE-08 eval convert batch rows adjusted from "
+                f"{requested_convert_batch_rows} to {self.convert_batch_rows} "
+                "to fit the exact transform batch buffer.")
+        logging.info(
+            "FE-08 on-the-fly eval will aggregate transformed rows before "
+            f"tensor conversion: convert_batch_rows={self.convert_batch_rows}")
         self.dense_stats = stats.get('dense_stats', {})
         self.count_edges = [int(x) for x in stats.get('match_count_buckets', [0, 1, 2, 4, 8])]
         self.match_col = str(stats.get('match_col', 'domain_d_seq_19'))
@@ -408,8 +431,6 @@ class FE08OnTheFlyEvalDataset(IterableDataset):
                 table = _fe08_append_or_replace_column(
                     table, name, pa.array(feats[name], type=pa.int64()))
 
-        table = _fe08_sort_sequence_columns_by_recency(table, self.output_schema)
-
         missing_output = [name for name in self.required_output if name not in table.schema.names]
         if missing_output:
             raise KeyError(
@@ -418,10 +439,36 @@ class FE08OnTheFlyEvalDataset(IterableDataset):
             )
         return table.select(self.required_output).to_batches()[0]
 
+    def _emit_transformed_batches(
+        self,
+        batches: Sequence[pa.RecordBatch],
+    ) -> Iterable[Dict[str, Any]]:
+        if not batches:
+            return
+        # Sequence recency sorting is row-local.  Do it after aggregating
+        # already-generated FE-08 rows so small eval parquet files do not pay
+        # the Python list-sort overhead once per file.
+        table = pa.Table.from_batches(list(batches))
+        table = _fe08_sort_sequence_columns_by_recency_fast(table, self.output_schema)
+        table = table.combine_chunks()
+        merged_batches = table.to_batches(max_chunksize=self.convert_batch_rows)
+
+        for transformed in merged_batches:
+            tensor_batch = self.converter._convert_batch(transformed)
+            B = transformed.num_rows
+            for start in range(0, B, self.infer_batch_size):
+                yield _slice_batch_dict(
+                    tensor_batch,
+                    start,
+                    min(start + self.infer_batch_size, B),
+                )
+
     def __iter__(self) -> Iterable[Dict[str, Any]]:
         state = FE08PrefixState()
         processed_rows = 0
         processed_batches = 0
+        buffered_batches: List[pa.RecordBatch] = []
+        buffered_rows = 0
         files = self.files
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is not None and worker_info.num_workers > 1:
@@ -435,7 +482,6 @@ class FE08OnTheFlyEvalDataset(IterableDataset):
             columns=self.read_columns,
         ):
             transformed = self._transform_batch(raw_batch, state)
-            tensor_batch = self.converter._convert_batch(transformed)
             B = transformed.num_rows
             processed_rows += B
             processed_batches += 1
@@ -443,12 +489,132 @@ class FE08OnTheFlyEvalDataset(IterableDataset):
                 logging.info(
                     f"FE-08 on-the-fly eval transformed {processed_rows} rows "
                     f"({processed_batches} batches)")
-            for start in range(0, B, self.infer_batch_size):
-                yield _slice_batch_dict(tensor_batch, start, min(start + self.infer_batch_size, B))
+            for offset in range(0, B, self.convert_batch_rows):
+                chunk = transformed.slice(
+                    offset,
+                    min(self.convert_batch_rows, B - offset),
+                )
+                if (
+                    buffered_batches
+                    and buffered_rows + chunk.num_rows > self.convert_batch_rows
+                ):
+                    yield from self._emit_transformed_batches(buffered_batches)
+                    buffered_batches = []
+                    buffered_rows = 0
+                buffered_batches.append(chunk)
+                buffered_rows += chunk.num_rows
+                if buffered_rows >= self.convert_batch_rows:
+                    yield from self._emit_transformed_batches(buffered_batches)
+                    buffered_batches = []
+                    buffered_rows = 0
+
+        if buffered_batches:
+            yield from self._emit_transformed_batches(buffered_batches)
 
 
 def _strip_prefix(prefix: str) -> str:
     return prefix[:-1] if prefix.endswith('_') else prefix
+
+
+def _fe08_sequence_sort_index(
+    ts_arr: pa.Array,
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    if not pa.types.is_list(ts_arr.type):
+        return None
+    offsets = ts_arr.offsets.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    values = ts_arr.values.fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    lengths = np.diff(offsets).astype(np.int64, copy=False)
+    if ts_arr.null_count:
+        null_rows = np.asarray(ts_arr.is_null().to_numpy(zero_copy_only=False), dtype=bool)
+        if bool(np.any(lengths[null_rows] > 0)):
+            return None
+    total = int(lengths.sum())
+    row_ids = np.repeat(np.arange(len(lengths), dtype=np.int64), lengths)
+    rel_pos = np.empty(total, dtype=np.int64)
+
+    cursor = 0
+    for row_i, length in enumerate(lengths):
+        n = int(length)
+        if n <= 0:
+            continue
+        if n == 1:
+            rel_pos[cursor] = 0
+        else:
+            start = int(offsets[row_i])
+            end = int(offsets[row_i + 1])
+            rel_pos[cursor:cursor + n] = np.argsort(-values[start:end], kind='stable')
+        cursor += n
+    return row_ids, rel_pos, lengths
+
+
+def _fe08_apply_sequence_sort(
+    arr: pa.Array,
+    row_ids: np.ndarray,
+    rel_pos: np.ndarray,
+    lengths: np.ndarray,
+) -> Optional[pa.Array]:
+    if not pa.types.is_list(arr.type):
+        return None
+    offsets = arr.offsets.to_numpy(zero_copy_only=False).astype(np.int64, copy=False)
+    if not np.array_equal(np.diff(offsets), lengths):
+        raise ValueError("FE-08 sequence sort length mismatch")
+    mask = None
+    if arr.null_count:
+        null_rows = np.asarray(arr.is_null().to_numpy(zero_copy_only=False), dtype=bool)
+        if bool(np.any(np.diff(offsets)[null_rows] > 0)):
+            return None
+        mask = arr.is_null()
+    gather = offsets[row_ids] + rel_pos
+    sorted_values = arr.values.take(pa.array(gather, type=pa.int64()))
+    return pa.ListArray.from_arrays(
+        pa.array(offsets, type=pa.int32()),
+        sorted_values,
+        mask=mask,
+    )
+
+
+def _fe08_sort_sequence_columns_by_recency_fast(
+    table: pa.Table,
+    schema: Dict[str, Any],
+) -> pa.Table:
+    names = set(table.schema.names)
+    idx = {name: i for i, name in enumerate(table.schema.names)}
+    for domain, cfg in schema.get('seq', {}).items():
+        prefix = _strip_prefix(str(cfg.get('prefix', '')))
+        ts_fid = cfg.get('ts_fid')
+        if ts_fid is None:
+            continue
+        ts_col = f'{prefix}_{int(ts_fid)}'
+        if ts_col not in names:
+            continue
+        cols = [
+            name for name in _fe08_sequence_columns({'seq': {domain: cfg}})[str(domain)]
+            if name in names
+        ]
+        if not cols:
+            continue
+
+        ts_arr = table.column(idx[ts_col]).combine_chunks()
+        sort_index = _fe08_sequence_sort_index(ts_arr)
+        if sort_index is None:
+            logging.info(
+                f"FE-08 fast sequence sort fallback for {domain}: "
+                "null or unsupported timestamp list column.")
+            return _fe08_sort_sequence_columns_by_recency(table, schema)
+        row_ids, rel_pos, lengths = sort_index
+
+        for col_name in cols:
+            arr = table.column(idx[col_name]).combine_chunks()
+            sorted_arr = _fe08_apply_sequence_sort(arr, row_ids, rel_pos, lengths)
+            if sorted_arr is None:
+                logging.info(
+                    f"FE-08 fast sequence sort fallback for {domain}: "
+                    f"null or unsupported side column {col_name}.")
+                return _fe08_sort_sequence_columns_by_recency(table, schema)
+            table = _fe08_append_or_replace_column(table, col_name, sorted_arr)
+            idx = {name: i for i, name in enumerate(table.schema.names)}
+            names = set(table.schema.names)
+    return table
 
 
 def _resolve_domain_d_columns(
@@ -939,7 +1105,7 @@ def maybe_build_fe08_eval_dataset(
                     table = _fe08_append_or_replace_column(
                         table, name, pa.array(feats[name], type=pa.int64()))
 
-            table = _fe08_sort_sequence_columns_by_recency(table, output_schema)
+            table = _fe08_sort_sequence_columns_by_recency_fast(table, output_schema)
 
             missing_output = [name for name in required_output if name not in table.schema.names]
             if missing_output:
@@ -1241,6 +1407,30 @@ def _batch_to_model_input(
     )
 
 
+def _batch_num_rows(batch: Dict[str, Any]) -> int:
+    ts = batch.get('timestamp')
+    if isinstance(ts, torch.Tensor):
+        return int(ts.shape[0])
+    user_ids = batch.get('user_id', [])
+    return len(user_ids)
+
+
+def _is_cuda_oom(exc: RuntimeError) -> bool:
+    msg = str(exc).lower()
+    return 'out of memory' in msg and ('cuda' in msg or 'cublas' in msg)
+
+
+def _predict_batch_probs(
+    model: PCVRHyFormer,
+    batch: Dict[str, Any],
+    device: str,
+) -> List[float]:
+    model_input = _batch_to_model_input(batch, device)
+    logits, _ = model.predict(model_input)
+    logits = logits.squeeze(-1)
+    return torch.sigmoid(logits).cpu().numpy().tolist()
+
+
 def main() -> None:
     # ---- Read environment variables ----
     model_dir = os.environ.get('MODEL_OUTPUT_PATH')
@@ -1267,8 +1457,30 @@ def main() -> None:
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
-    # ---- Data loading: reuse batch_size / num_workers from training config ----
-    batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
+    # ---- Data loading: train batch size is not a semantic eval constraint. ----
+    train_batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
+    default_infer_batch_size = 1024 if torch.cuda.is_available() else train_batch_size
+    batch_size = int(os.environ.get(
+        'FE08_EVAL_INFER_BATCH_SIZE',
+        default_infer_batch_size,
+    ))
+    min_infer_batch_size = int(os.environ.get(
+        'FE08_EVAL_MIN_INFER_BATCH_SIZE',
+        train_batch_size,
+    ))
+    if batch_size <= 0:
+        raise ValueError(f"FE08_EVAL_INFER_BATCH_SIZE must be positive; got {batch_size}.")
+    if min_infer_batch_size <= 0:
+        raise ValueError(
+            "FE08_EVAL_MIN_INFER_BATCH_SIZE must be positive; "
+            f"got {min_infer_batch_size}."
+        )
+    min_infer_batch_size = min(min_infer_batch_size, batch_size)
+    logging.info(
+        "Eval batch sizing: "
+        f"train_batch_size={train_batch_size}, "
+        f"infer_batch_size={batch_size}, "
+        f"min_infer_batch_size={min_infer_batch_size}")
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
     schema_has_fe08 = _schema_has_fe08_columns(schema_path)
@@ -1372,22 +1584,52 @@ def main() -> None:
     all_probs = []
     all_user_ids = []
     processed_count = 0
+    next_log_count = 25000
+    active_model_batch_size = batch_size
     logging.info("Starting inference...")
 
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(test_loader):
-            model_input = _batch_to_model_input(batch, device)
-            user_ids = batch.get('user_id', [])
+    with torch.inference_mode():
+        for batch in test_loader:
+            batch_rows = _batch_num_rows(batch)
+            start = 0
+            while start < batch_rows:
+                end = min(start + active_model_batch_size, batch_rows)
+                model_batch = (
+                    batch
+                    if start == 0 and end == batch_rows
+                    else _slice_batch_dict(batch, start, end)
+                )
+                try:
+                    probs = _predict_batch_probs(model, model_batch, device)
+                except RuntimeError as exc:
+                    if (
+                        torch.cuda.is_available()
+                        and _is_cuda_oom(exc)
+                        and active_model_batch_size > min_infer_batch_size
+                    ):
+                        new_batch_size = max(
+                            min_infer_batch_size,
+                            active_model_batch_size // 2,
+                        )
+                        logging.warning(
+                            "CUDA OOM during eval at model_batch_size="
+                            f"{active_model_batch_size}; retrying with "
+                            f"{new_batch_size}.")
+                        active_model_batch_size = new_batch_size
+                        torch.cuda.empty_cache()
+                        continue
+                    raise
 
-            logits, _ = model.predict(model_input)
-            logits = logits.squeeze(-1)
-            probs = torch.sigmoid(logits).cpu().numpy()
-            all_probs.extend(probs.tolist())
-            all_user_ids.extend(user_ids)
-            processed_count += len(probs)
+                user_ids = model_batch.get('user_id', [])
+                all_probs.extend(probs)
+                all_user_ids.extend(user_ids)
+                processed_count += len(probs)
+                start = end
 
-            if (batch_idx + 1) % 100 == 0:
-                logging.info(f"  Processed {processed_count} samples")
+                if processed_count >= next_log_count:
+                    logging.info(f"  Processed {processed_count} samples")
+                    while next_log_count <= processed_count:
+                        next_log_count += 25000
 
     logging.info(f"Inference complete: {len(all_probs)} predictions")
 
