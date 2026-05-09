@@ -14,16 +14,72 @@ set -euo pipefail
 #   BENCH_COMPILE_MODE=reduce-overhead
 #   BENCH_OUTPUT_ROOT=/path/to/output
 #
-# Extra CLI args are appended to every run, for example:
+# Extra train.py args are appended to every run, for example:
 #   ./benchmark_full_data_2epoch.sh /data --batch_size 192
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 DATA_DIR="${BENCH_DATA_DIR:-${TRAIN_DATA_PATH:-}}"
-if [[ $# -gt 0 && "${1}" != --* ]]; then
-  DATA_DIR="$1"
-  shift
-fi
+SCHEMA_PATH=""
+EXTRA_ARGS=()
+
+# The competition platform may append --data_dir/--schema_path/--num_epochs
+# to the entry command. Consume those known options here instead of forwarding
+# them again to run.sh; otherwise the same arguments can be duplicated many
+# times in the pod log and eventually break command parsing.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --data_dir)
+      DATA_DIR="$2"
+      shift 2
+      ;;
+    --schema_path)
+      SCHEMA_PATH="$2"
+      shift 2
+      ;;
+    --num_epochs)
+      BENCH_EPOCHS="$2"
+      shift 2
+      ;;
+    --eval_every_n_steps)
+      # Benchmark always disables step-level eval; consume platform default.
+      shift 2
+      ;;
+    --use_amp|--use_compile|--compile_dynamic)
+      # These are controlled per benchmark run below.
+      shift
+      ;;
+    --amp_dtype)
+      BENCH_AMP_DTYPE="$2"
+      shift 2
+      ;;
+    --compile_mode)
+      BENCH_COMPILE_MODE="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      EXTRA_ARGS+=("$@")
+      break
+      ;;
+    --*)
+      EXTRA_ARGS+=("$1")
+      shift
+      if [[ $# -gt 0 && "$1" != --* ]]; then
+        EXTRA_ARGS+=("$1")
+        shift
+      fi
+      ;;
+    *)
+      if [[ -z "${DATA_DIR}" ]]; then
+        DATA_DIR="$1"
+      else
+        EXTRA_ARGS+=("$1")
+      fi
+      shift
+      ;;
+  esac
+done
 
 if [[ -z "${DATA_DIR}" ]]; then
   echo "ERROR: set TRAIN_DATA_PATH, BENCH_DATA_DIR, or pass data_dir as first arg." >&2
@@ -35,7 +91,9 @@ if [[ ! -d "${DATA_DIR}" ]]; then
   exit 2
 fi
 
-SCHEMA_PATH="${DATA_DIR}/schema.json"
+if [[ -z "${SCHEMA_PATH}" ]]; then
+  SCHEMA_PATH="${DATA_DIR}/schema.json"
+fi
 if [[ ! -f "${SCHEMA_PATH}" ]]; then
   echo "ERROR: schema.json not found under data directory: ${SCHEMA_PATH}" >&2
   exit 2
@@ -46,7 +104,6 @@ BENCH_EPOCHS="${BENCH_EPOCHS:-2}"
 BENCH_AMP_DTYPE="${BENCH_AMP_DTYPE:-bf16}"
 BENCH_COMPILE_MODE="${BENCH_COMPILE_MODE:-reduce-overhead}"
 BENCH_OUTPUT_ROOT="${BENCH_OUTPUT_ROOT:-${REPO_DIR}/outputs/bench_full_data_2epoch_$(date +%Y%m%d_%H%M%S)}"
-EXTRA_ARGS=("$@")
 
 mkdir -p "${BENCH_OUTPUT_ROOT}"
 SUMMARY_PATH="${BENCH_OUTPUT_ROOT}/summary.tsv"
@@ -67,7 +124,7 @@ fi
   echo "bench_epochs=${BENCH_EPOCHS}"
   echo "bench_amp_dtype=${BENCH_AMP_DTYPE}"
   echo "bench_compile_mode=${BENCH_COMPILE_MODE}"
-  echo "extra_args=${EXTRA_ARGS[*]:-}"
+  echo "extra_args=${EXTRA_ARGS[*]:-<none>}"
   python3 - <<'PY'
 try:
     import torch
@@ -98,7 +155,8 @@ run_one() {
   echo
   echo "================================================================"
   echo "[bench] ${label}"
-  echo "flags: ${flags[*]:-<none>} ${EXTRA_ARGS[*]:-}"
+  echo "flags: ${flags[*]:-<none>}"
+  echo "extra_args: ${EXTRA_ARGS[*]:-<none>}"
   echo "output: ${run_dir}"
   echo "================================================================"
 
