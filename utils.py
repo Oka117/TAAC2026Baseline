@@ -191,12 +191,13 @@ class EarlyStopping:
                 verbatim as ``self.best_extra_metrics``; not interpreted
                 by ``EarlyStopping`` itself.
         """
+        state_model = getattr(model, '_orig_mod', model)
         if self.best_score is None:
             self.best_score = score
             self.best_extra_metrics = extra_metrics
             self.best_saved_score = 0.0
             self.save_checkpoint(score, model)
-            self.best_model = copy.deepcopy(model.state_dict())
+            self.best_model = copy.deepcopy(state_model.state_dict())
         elif self._is_not_improved(score):
             self.counter += 1
             logging.info(f'{self.label}earlyStopping counter: {self.counter} / {self.patience}')
@@ -205,7 +206,7 @@ class EarlyStopping:
         else:
             logging.info(f'{self.label}earlyStopping counter reset!')
             self.best_score = score
-            self.best_model = copy.deepcopy(model.state_dict())
+            self.best_model = copy.deepcopy(state_model.state_dict())
             self.best_extra_metrics = extra_metrics
             self.save_checkpoint(score, model)
             self.counter = 0
@@ -229,7 +230,8 @@ class EarlyStopping:
         if self.verbose:
             logging.info('Validation score increased. Saving model ...')
         os.makedirs(os.path.dirname(self.checkpoint_path), exist_ok=True)
-        torch.save(model.state_dict(), self.checkpoint_path)
+        state_model = getattr(model, '_orig_mod', model)
+        torch.save(state_model.state_dict(), self.checkpoint_path)
         self.best_saved_score = score
 
 

@@ -477,7 +477,7 @@ class MultiSeqQueryGenerator(nn.Module):
         for i in range(self.num_sequences):
             # MeanPool(Seq_i)
             valid_mask = ~seq_padding_masks[i]  # True = valid
-            valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
+            valid_mask_expanded = valid_mask.unsqueeze(-1).to(seq_tokens_list[i].dtype)  # (B, L_i, 1)
             seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
@@ -711,7 +711,7 @@ class LongerEncoder(nn.Module):
         new_padding_mask = pos_indices < pad_count.unsqueeze(1)  # (B, top_k)
 
         # Zero out tokens at padding positions
-        top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).float()
+        top_k_tokens = top_k_tokens * (~new_padding_mask).unsqueeze(-1).to(top_k_tokens.dtype)
 
         # position_indices for Q-side RoPE
         position_indices = indices  # (B, top_k)

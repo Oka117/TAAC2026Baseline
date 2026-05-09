@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -60,6 +61,7 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.model: nn.Module = model
+        self.base_model: nn.Module = getattr(model, '_orig_mod', model)
         self.train_loader: DataLoader = train_loader
         self.valid_loader: DataLoader = valid_loader
         self.writer = writer
@@ -74,9 +76,9 @@ class PCVRHyFormerRankingTrainer:
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
-        if hasattr(model, 'get_sparse_params'):
-            sparse_params = model.get_sparse_params()
-            dense_params = model.get_dense_params()
+        if hasattr(self.base_model, 'get_sparse_params'):
+            sparse_params = self.base_model.get_sparse_params()
+            dense_params = self.base_model.get_dense_params()
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
@@ -90,7 +92,7 @@ class PCVRHyFormerRankingTrainer:
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                self.base_model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
 
         self.num_epochs: int = num_epochs
@@ -107,6 +109,43 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
+        cfg = train_config or {}
+        self.use_amp: bool = bool(cfg.get('use_amp', False))
+        self.amp_dtype: torch.dtype = torch.float32
+        self.scaler: Optional[torch.cuda.amp.GradScaler] = None
+
+        if self.use_amp and not (
+            str(device).startswith('cuda') and torch.cuda.is_available()
+        ):
+            logging.warning("AMP requested but CUDA is not available; disabling AMP")
+            self.use_amp = False
+
+        if self.use_amp:
+            requested_dtype = cfg.get('amp_dtype', 'auto')
+            if requested_dtype == 'auto':
+                self.amp_dtype = (
+                    torch.bfloat16 if torch.cuda.is_bf16_supported()
+                    else torch.float16
+                )
+            elif requested_dtype == 'bf16':
+                self.amp_dtype = torch.bfloat16
+            elif requested_dtype == 'fp16':
+                self.amp_dtype = torch.float16
+            else:
+                raise ValueError(f"Unsupported amp_dtype: {requested_dtype}")
+
+            if (
+                self.amp_dtype == torch.bfloat16
+                and not torch.cuda.is_bf16_supported()
+            ):
+                raise RuntimeError(
+                    "amp_dtype=bf16 requested but this CUDA device "
+                    "does not support bf16"
+                )
+
+            logging.info(f"AMP enabled: dtype={self.amp_dtype}")
+            if self.amp_dtype == torch.float16:
+                self.scaler = torch.cuda.amp.GradScaler()
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
@@ -189,7 +228,7 @@ class PCVRHyFormerRankingTrainer:
         ckpt_dir = os.path.join(self.save_dir, dir_name)
         os.makedirs(ckpt_dir, exist_ok=True)
         if not skip_model_file:
-            torch.save(self.model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+            torch.save(self.base_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
         self._write_sidecar_files(ckpt_dir)
         logging.info(f"Saved checkpoint to {ckpt_dir}/model.pt")
         return ckpt_dir
@@ -252,7 +291,7 @@ class PCVRHyFormerRankingTrainer:
         if not is_likely_new_best:
             # No new best anticipated: leave disk untouched. The previous
             # best_model dir (with its model.pt + sidecars) remains valid.
-            self.early_stopping(val_auc, self.model, {
+            self.early_stopping(val_auc, self.base_model, {
                 "best_val_AUC": val_auc,
                 "best_val_logloss": val_logloss,
             })
@@ -271,7 +310,7 @@ class PCVRHyFormerRankingTrainer:
         # I/O needed when a new best is confirmed.
         self._remove_old_best_dirs()
 
-        self.early_stopping(val_auc, self.model, {
+        self.early_stopping(val_auc, self.base_model, {
             "best_val_AUC": val_auc,
             "best_val_logloss": val_logloss,
         })
@@ -293,6 +332,7 @@ class PCVRHyFormerRankingTrainer:
         """
         print("Start training (PCVRHyFormer)")
         self.model.train()
+        self.base_model.train()
         total_step = 0
 
         for epoch in range(1, self.num_epochs + 1):
@@ -315,6 +355,7 @@ class PCVRHyFormerRankingTrainer:
                     logging.info(f"Evaluating at step {total_step}")
                     val_auc, val_logloss = self.evaluate(epoch=epoch)
                     self.model.train()
+                    self.base_model.train()
                     torch.cuda.empty_cache()
 
                     logging.info(f"Step {total_step} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
@@ -333,6 +374,7 @@ class PCVRHyFormerRankingTrainer:
 
             val_auc, val_logloss = self.evaluate(epoch=epoch)
             self.model.train()
+            self.base_model.train()
             torch.cuda.empty_cache()
 
             logging.info(f"Epoch {epoch} Validation | AUC: {val_auc}, LogLoss: {val_logloss}")
@@ -361,8 +403,8 @@ class PCVRHyFormerRankingTrainer:
                         if p.data_ptr() in self.sparse_optimizer.state:
                             old_state[p.data_ptr()] = self.sparse_optimizer.state[p]
 
-                reinit_ptrs = self.model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
-                sparse_params = self.model.get_sparse_params()
+                reinit_ptrs = self.base_model.reinit_high_cardinality_params(self.reinit_cardinality_threshold)
+                sparse_params = self.base_model.get_sparse_params()
                 self.sparse_optimizer = torch.optim.Adagrad(
                     sparse_params, lr=self.sparse_lr, weight_decay=self.sparse_weight_decay
                 )
@@ -374,6 +416,12 @@ class PCVRHyFormerRankingTrainer:
                         restored += 1
                 logging.info(f"Rebuilt Adagrad optimizer after epoch {epoch}, "
                              f"restored optimizer state for {restored} low-cardinality params")
+
+    def _amp_context(self):
+        """Return the active autocast context or a no-op context."""
+        if self.use_amp:
+            return torch.cuda.amp.autocast(dtype=self.amp_dtype)
+        return nullcontext()
 
     def _make_model_input(self, device_batch: Dict[str, Any]) -> ModelInput:
         """Construct a ``ModelInput`` NamedTuple from a device_batch dict."""
@@ -409,21 +457,39 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
+        with self._amp_context():
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
 
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(
+                    logits, label,
+                    alpha=self.focal_alpha,
+                    gamma=self.focal_gamma,
+                )
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
+
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.unscale_(self.sparse_optimizer)
+            # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug
+            # observed with certain tensor shapes in this project.
+            torch.nn.utils.clip_grad_norm_(
+                self.base_model.parameters(), max_norm=1.0, foreach=False)
+            self.scaler.step(self.dense_optimizer)
+            if self.sparse_optimizer is not None:
+                self.scaler.step(self.sparse_optimizer)
+            self.scaler.update()
         else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
-        loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
-
-        self.dense_optimizer.step()
-        if self.sparse_optimizer is not None:
-            self.sparse_optimizer.step()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.base_model.parameters(), max_norm=1.0, foreach=False)
+            self.dense_optimizer.step()
+            if self.sparse_optimizer is not None:
+                self.sparse_optimizer.step()
 
         return loss.item()
 
@@ -435,6 +501,7 @@ class PCVRHyFormerRankingTrainer:
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
+        self.base_model.eval()
         if not epoch:
             epoch = -1
 
@@ -488,7 +555,8 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+        with self._amp_context():
+            logits, _ = self.base_model.predict(model_input)  # (B, 1), (B, D)
         logits = logits.squeeze(-1)  # (B,)
 
         return logits, label

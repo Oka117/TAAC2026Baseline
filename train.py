@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -143,6 +143,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--focal_gamma', type=float, default=2.0,
                         help='Focal Loss focusing parameter gamma '
                              '(effective only when --loss_type=focal)')
+
+    # Mixed precision / compile acceleration.
+    parser.add_argument('--use_amp', action='store_true', default=False,
+                        help='Enable CUDA autocast mixed precision training')
+    parser.add_argument('--amp_dtype', type=str, default='auto',
+                        choices=['auto', 'bf16', 'fp16'],
+                        help='AMP dtype: auto = bf16 if supported else fp16')
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Enable torch.compile for the model forward path')
+    parser.add_argument('--compile_mode', type=str, default='reduce-overhead',
+                        choices=['default', 'reduce-overhead', 'max-autotune'],
+                        help='torch.compile mode')
+    parser.add_argument('--compile_dynamic', action='store_true', default=False,
+                        help='Enable dynamic shapes for torch.compile')
 
     # Sparse optimizer.
     parser.add_argument('--sparse_lr', type=float, default=0.05,
@@ -319,16 +333,34 @@ def main() -> None:
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+    raw_model = model
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)
-    num_ns = model.num_ns
+    num_ns = raw_model.num_ns
     T = args.num_queries * num_sequences + num_ns
     logging.info(f"PCVRHyFormer model created: num_ns={num_ns}, T={T}, d_model={args.d_model}, rank_mixer_mode={args.rank_mixer_mode}")
     logging.info(f"User NS groups: {user_ns_groups}")
     logging.info(f"Item NS groups: {item_ns_groups}")
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = sum(p.numel() for p in raw_model.parameters())
     logging.info(f"Total parameters: {total_params:,}")
+
+    if args.use_compile:
+        if not hasattr(torch, 'compile'):
+            raise SystemExit("torch.compile requires PyTorch >= 2.0")
+        if not str(args.device).startswith('cuda'):
+            logging.warning("torch.compile is enabled on a non-CUDA device; "
+                            "this is allowed but usually not useful for this workload")
+        logging.info(
+            f"Compiling model with mode={args.compile_mode}, "
+            f"dynamic={args.compile_dynamic}"
+        )
+        model = torch.compile(
+            raw_model,
+            mode=args.compile_mode,
+            dynamic=args.compile_dynamic,
+            fullgraph=False,
+        )
 
     # ---- Training ----
     early_stopping = EarlyStopping(
