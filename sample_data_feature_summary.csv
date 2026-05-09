@@ -1,0 +1,121 @@
+col,family,dtype,nunique,missing,guess
+user_id,meta,int64,1000,0.0,
+item_id,meta,int64,837,0.0,
+label_type,meta,int32,2,0.0,
+label_time,meta,int64,553,0.0,
+timestamp,meta,int64,501,0.0,
+user_int_feats_1,user_int,int64,3,0.0,客户端/OS 类型 (3 类，跳过 3)
+user_int_feats_3,user_int,float64,341,0.03,
+user_int_feats_4,user_int,float64,268,0.03,
+user_int_feats_15,user_int,list,,0.139,
+user_int_feats_48,user_int,float64,52,0.002,城市等级 / 城市分档 (52)
+user_int_feats_49,user_int,float64,2,0.007,⭐ 性别 (58:42 接近真实男女比)
+user_int_feats_50,user_int,float64,2,0.004,是否实名/激活 (994:2)
+user_int_feats_51,user_int,float64,5,0.001,"用户类型 (近似常量, 56=99.5%)"
+user_int_feats_52,user_int,float64,36,0.001,一级行业兴趣 (36 档)
+user_int_feats_53,user_int,float64,264,0.001,
+user_int_feats_54,user_int,float64,462,0.368,
+user_int_feats_55,user_int,float64,13,0.019,年龄段 (13 段)
+user_int_feats_56,user_int,float64,405,0.019,
+user_int_feats_57,user_int,float64,105,0.031,
+user_int_feats_58,user_int,float64,2,0.15,婚姻状况 (70:30)
+user_int_feats_59,user_int,float64,8,0.15,学历 / 收入 (8 档)
+user_int_feats_60,user_int,list,,0.592,
+user_int_feats_62,user_int,list,,0.07,
+user_int_feats_63,user_int,list,,0.07,
+user_int_feats_64,user_int,list,,0.07,
+user_int_feats_65,user_int,list,,0.08,
+user_int_feats_66,user_int,list,,0.086,
+user_int_feats_80,user_int,list,,0.2,
+user_int_feats_82,user_int,float64,23,0.204,省级行政区 (23 省)
+user_int_feats_86,user_int,float64,61,0.692,
+user_int_feats_89,user_int,list,,0.055,
+user_int_feats_90,user_int,list,,0.091,
+user_int_feats_91,user_int,list,,0.45,
+user_int_feats_92,user_int,float64,2,0.494,实验组 / 流量分桶 (完美 50:50)
+user_int_feats_93,user_int,float64,36,0.171,兴趣大类 / 二级地域 (36 档)
+user_int_feats_94,user_int,float64,6,0.521,消费/活跃等级 (6 档)
+user_int_feats_95,user_int,float64,3,0.318,兴趣偏好等级 (3 档)
+user_int_feats_96,user_int,float64,3,0.678,兴趣偏好等级 (3 档)
+user_int_feats_97,user_int,float64,3,0.292,兴趣偏好等级 (3 档)
+user_int_feats_98,user_int,float64,3,0.103,兴趣偏好等级 (3 档)
+user_int_feats_99,user_int,float64,2,0.812,兴趣偏好二值
+user_int_feats_100,user_int,float64,2,0.845,兴趣偏好二值
+user_int_feats_101,user_int,float64,2,0.91,兴趣偏好二值
+user_int_feats_102,user_int,float64,2,0.877,兴趣偏好二值
+user_int_feats_103,user_int,float64,3,0.862,兴趣偏好等级 (3 档)
+user_int_feats_104,user_int,float64,3,0.372,兴趣偏好等级 (3 档)
+user_int_feats_105,user_int,float64,3,0.309,兴趣偏好等级 (3 档)
+user_int_feats_106,user_int,float64,3,0.16,兴趣偏好等级 (3 档)
+user_int_feats_107,user_int,float64,2,0.3,兴趣偏好二值
+user_int_feats_108,user_int,float64,6,0.516,兴趣偏好等级 (6 档)
+user_int_feats_109,user_int,float64,7,0.854,兴趣偏好等级 (7 档)
+user_dense_feats_61,user_dense,list,,0.002,
+user_dense_feats_62,user_dense,list,,0.07,
+user_dense_feats_63,user_dense,list,,0.07,
+user_dense_feats_64,user_dense,list,,0.07,
+user_dense_feats_65,user_dense,list,,0.08,
+user_dense_feats_66,user_dense,list,,0.086,
+user_dense_feats_87,user_dense,list,,0.015,
+user_dense_feats_89,user_dense,list,,0.055,
+user_dense_feats_90,user_dense,list,,0.091,
+user_dense_feats_91,user_dense,list,,0.45,
+item_int_feats_5,item_int,float64,82,0.002,三级品类 (82 类)
+item_int_feats_6,item_int,float64,216,0.002,高基数行业细类
+item_int_feats_7,item_int,float64,349,0.002,计数/排名分桶
+item_int_feats_8,item_int,float64,226,0.002,计数/排名分桶 (含 -1)
+item_int_feats_9,item_int,float64,24,0.002,一级行业类目 (24 类)
+item_int_feats_10,item_int,float64,110,0.002,创意标签 (110 类)
+item_int_feats_11,item_int,list,,0.439,
+item_int_feats_12,item_int,float64,352,0.002,计数/排名分桶
+item_int_feats_13,item_int,float64,8,0.002,广告创意类型 (8 类)
+item_int_feats_16,item_int,float64,662,0.002,物料子 ID (高基数)
+item_int_feats_81,item_int,float64,3,0.002,投放渠道 (3 档)
+item_int_feats_83,item_int,float64,22,0.832,二级行业 (22 类)
+item_int_feats_84,item_int,float64,66,0.832,行业子类 (66 类)
+item_int_feats_85,item_int,float64,103,0.832,广告主分组 (103 类)
+domain_a_seq_38,seq_a,list,,0.005,
+domain_a_seq_39,seq_a,list,,0.005,
+domain_a_seq_40,seq_a,list,,0.005,
+domain_a_seq_41,seq_a,list,,0.005,
+domain_a_seq_42,seq_a,list,,0.005,
+domain_a_seq_43,seq_a,list,,0.005,
+domain_a_seq_44,seq_a,list,,0.005,
+domain_a_seq_45,seq_a,list,,0.005,
+domain_a_seq_46,seq_a,list,,0.005,
+domain_b_seq_67,seq_b,list,,0.012,
+domain_b_seq_68,seq_b,list,,0.012,
+domain_b_seq_69,seq_b,list,,0.012,
+domain_b_seq_70,seq_b,list,,0.012,
+domain_b_seq_71,seq_b,list,,0.012,
+domain_b_seq_72,seq_b,list,,0.012,
+domain_b_seq_73,seq_b,list,,0.012,
+domain_b_seq_74,seq_b,list,,0.012,
+domain_b_seq_75,seq_b,list,,0.012,
+domain_b_seq_76,seq_b,list,,0.012,
+domain_b_seq_77,seq_b,list,,0.012,
+domain_b_seq_78,seq_b,list,,0.012,
+domain_b_seq_79,seq_b,list,,0.012,
+domain_b_seq_88,seq_b,list,,0.012,
+domain_c_seq_27,seq_c,list,,0.002,
+domain_c_seq_28,seq_c,list,,0.002,
+domain_c_seq_29,seq_c,list,,0.002,
+domain_c_seq_30,seq_c,list,,0.002,
+domain_c_seq_31,seq_c,list,,0.002,
+domain_c_seq_32,seq_c,list,,0.002,
+domain_c_seq_33,seq_c,list,,0.002,
+domain_c_seq_34,seq_c,list,,0.002,
+domain_c_seq_35,seq_c,list,,0.002,
+domain_c_seq_36,seq_c,list,,0.002,
+domain_c_seq_37,seq_c,list,,0.002,
+domain_c_seq_47,seq_c,list,,0.002,
+domain_d_seq_17,seq_d,list,,0.08,
+domain_d_seq_18,seq_d,list,,0.08,
+domain_d_seq_19,seq_d,list,,0.08,
+domain_d_seq_20,seq_d,list,,0.08,
+domain_d_seq_21,seq_d,list,,0.08,
+domain_d_seq_22,seq_d,list,,0.08,
+domain_d_seq_23,seq_d,list,,0.08,
+domain_d_seq_24,seq_d,list,,0.08,
+domain_d_seq_25,seq_d,list,,0.08,
+domain_d_seq_26,seq_d,list,,0.08,
