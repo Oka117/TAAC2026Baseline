@@ -1,0 +1,15 @@
+[
+  {"item_fid": 9,  "domain": "domain_d", "seq_fid": 19},
+  {"item_fid": 10, "domain": "domain_d", "seq_fid": 24},
+  {"item_fid": 13, "domain": "domain_c", "seq_fid": 31},
+
+  {"item_fid": 9,  "domain": "domain_a", "seq_fid": 42},
+  {"item_fid": 9,  "domain": "domain_b", "seq_fid": 70},
+  {"item_fid": 9,  "domain": "domain_c", "seq_fid": 30},
+
+  {"item_fid": 10, "domain": "domain_a", "seq_fid": 43},
+  {"item_fid": 10, "domain": "domain_b", "seq_fid": 71},
+
+  {"item_fid": 13, "domain": "domain_a", "seq_fid": 41},
+  {"item_fid": 13, "domain": "domain_b", "seq_fid": 75}
+]

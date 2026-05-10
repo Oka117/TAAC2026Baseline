@@ -131,6 +131,26 @@ BUCKET_BOUNDARIES = np.array([
 # ``--use_time_buckets`` and derive the concrete bucket count from here.
 NUM_TIME_BUCKETS = len(BUCKET_BOUNDARIES) + 1
 
+# ────────────────── Plan A: target item × history matching ───────────────────
+# Per-pair feature layout (kept dense, no embedding):
+#   0: has_match           (binary, 1 if target appears in seq at least once)
+#   1: log1p_match_count   (total hits)
+#   2: log1p_match_1d      (hits within 1 day - falls back to 0 when ts_fid=None)
+#   3: log1p_match_7d      (hits within 7 days)
+#   4: log1p_match_30d     (hits within 30 days)
+#   5: log1p_min_delta     (seconds since the most recent hit; 0 if no hit/ts)
+NUM_MATCH_FEATURES_PER_PAIR = 6
+
+# Demo-verified strong pairs (see README.feature_engineering.zh.md §6.3):
+#   item_int_feats_9  × domain_d_seq_19  → 26.8 % vs 11.8 % positive rate
+#   item_int_feats_10 × domain_d_seq_24  → 23.2 % vs 11.4 %
+#   item_int_feats_13 × domain_c_seq_31  → 35.0 % vs 11.9 %
+DEFAULT_MATCH_PAIRS: List[Dict[str, Any]] = [
+    {"item_fid": 9,  "domain": "domain_d", "seq_fid": 19},
+    {"item_fid": 10, "domain": "domain_d", "seq_fid": 24},
+    {"item_fid": 13, "domain": "domain_c", "seq_fid": 31},
+]
+
 
 class PCVRParquetDataset(IterableDataset):
     """PCVR dataset that reads raw multi-column Parquet directly.
@@ -153,6 +173,7 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        match_pairs: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Args:
@@ -170,6 +191,10 @@ class PCVRParquetDataset(IterableDataset):
             clip_vocab: if True, clip out-of-bound ids to 0; if False, raise.
             is_training: if True, derive ``label`` from ``label_type == 2``;
                 if False, return an all-zeros label column.
+            match_pairs: optional list of Plan-A target-item × history matching
+                pairs, each ``{"item_fid": int, "domain": str, "seq_fid": int}``.
+                Pairs that cannot be located in the loaded schema are silently
+                skipped with a warning. ``None`` or empty list disables Plan A.
         """
         super().__init__()
 
@@ -263,6 +288,86 @@ class PCVRParquetDataset(IterableDataset):
                 side_plan.append((ci, slot, vs))
             ts_ci = self._col_idx.get(f'{prefix}_{ts_fid}') if ts_fid is not None else None
             self._seq_plan[domain] = (side_plan, ts_ci)
+
+        # ---- Plan A: target item × history matching plan ----
+        # Resolve item_fid -> (offset, dim, vocab_size) once for fast lookup
+        # during _convert_batch.
+        item_int_fid_to_offset_dim: Dict[int, Tuple[int, int, int]] = {}
+        offset = 0
+        for fid, vs, dim in self._item_int_cols:
+            item_int_fid_to_offset_dim[int(fid)] = (offset, int(dim), int(vs))
+            offset += int(dim)
+
+        self._match_pairs: List[Dict[str, Any]] = []
+        # {domain: [(pair_idx, item_offset, item_dim, seq_slot, item_fid, seq_fid)]}
+        self._match_plan_by_domain: Dict[
+            str, List[Tuple[int, int, int, int, int, int]]
+        ] = {}
+
+        for raw_pair in (match_pairs or []):
+            try:
+                item_fid = int(raw_pair['item_fid'])
+                domain = str(raw_pair['domain'])
+                seq_fid = int(raw_pair['seq_fid'])
+            except (KeyError, TypeError, ValueError) as e:
+                logging.warning(
+                    f"match_pair {raw_pair} skipped: malformed entry ({e}); "
+                    f"expected keys item_fid/domain/seq_fid"
+                )
+                continue
+
+            if item_fid not in item_int_fid_to_offset_dim:
+                logging.warning(
+                    f"match_pair {raw_pair} skipped: item_fid {item_fid} "
+                    f"not in schema item_int columns"
+                )
+                continue
+            i_offset, i_dim, _ = item_int_fid_to_offset_dim[item_fid]
+            if i_dim != 1:
+                logging.warning(
+                    f"match_pair {raw_pair} skipped: item_fid {item_fid} has "
+                    f"dim={i_dim}, only scalar (dim=1) item fields are supported"
+                )
+                continue
+            if domain not in self.seq_domains:
+                logging.warning(
+                    f"match_pair {raw_pair} skipped: domain {domain} not "
+                    f"present in seq_domains={self.seq_domains}"
+                )
+                continue
+            sideinfo = self.sideinfo_fids[domain]
+            if seq_fid not in sideinfo:
+                logging.warning(
+                    f"match_pair {raw_pair} skipped: seq_fid {seq_fid} not in "
+                    f"sideinfo of {domain} (={sideinfo})"
+                )
+                continue
+
+            new_idx = len(self._match_pairs)
+            self._match_pairs.append({
+                "item_fid": item_fid,
+                "domain": domain,
+                "seq_fid": seq_fid,
+            })
+            self._match_plan_by_domain.setdefault(domain, []).append(
+                (new_idx, i_offset, i_dim, sideinfo.index(seq_fid),
+                 item_fid, seq_fid)
+            )
+
+        self.match_feats_dim: int = (
+            len(self._match_pairs) * NUM_MATCH_FEATURES_PER_PAIR
+        )
+        if self._match_pairs:
+            logging.info(
+                f"Plan A enabled: {len(self._match_pairs)} match pairs → "
+                f"match_feats_dim={self.match_feats_dim}. "
+                f"Pairs: {self._match_pairs}"
+            )
+            self._buf_match_feats = np.zeros(
+                (B, self.match_feats_dim), dtype=np.float32
+            )
+        else:
+            self._buf_match_feats = None
 
         logging.info(
             f"PCVRParquetDataset: {self.num_rows} rows from "
@@ -581,6 +686,13 @@ class PCVRParquetDataset(IterableDataset):
             '_seq_domains': self.seq_domains,
         }
 
+        # Plan A buffer (re-used across batches; sliced to current B).
+        if self._buf_match_feats is not None:
+            match_feats = self._buf_match_feats[:B]
+            match_feats[:] = 0
+        else:
+            match_feats = None
+
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:
             max_len = self._seq_maxlen[domain]
@@ -666,6 +778,59 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            # ---- Plan A: target item × history matching, in-domain block ----
+            # Computed inline so that ``time_diff`` / ``ts_padded`` (only valid
+            # when ``ts_ci is not None``) and ``out`` (already validated) are
+            # still in scope. When ``ts_ci is None`` (e.g. the smoke-test
+            # schema), windowed counts and the recency feature degrade to 0
+            # but ``has_match`` / ``match_count`` remain meaningful.
+            if match_feats is not None and domain in self._match_plan_by_domain:
+                has_ts = ts_ci is not None
+                for (pair_idx, i_offset, _i_dim, slot,
+                     _item_fid, _seq_fid) in self._match_plan_by_domain[domain]:
+                    target = item_int[:, i_offset]                # (B,)
+                    seq_vals = out[:, slot, :]                    # (B, max_len)
+                    target_col = target.reshape(-1, 1)
+                    match_mask = (
+                        (seq_vals == target_col)
+                        & (seq_vals > 0)
+                        & (target_col > 0)
+                    )
+
+                    match_count = match_mask.sum(axis=1).astype(np.float32)
+                    has_match = (match_count > 0).astype(np.float32)
+
+                    if has_ts:
+                        match_1d = (match_mask & (time_diff <= 86400)).sum(axis=1)
+                        match_7d = (match_mask & (time_diff <= 604800)).sum(axis=1)
+                        match_30d = (match_mask & (time_diff <= 2592000)).sum(axis=1)
+                        masked_dt = np.where(
+                            match_mask, time_diff, np.iinfo(np.int64).max
+                        ).astype(np.int64)
+                        min_dt = masked_dt.min(axis=1)
+                        # When no match exists for a row, the "min" is the
+                        # sentinel; collapse it to 0 so log1p stays bounded.
+                        min_dt = np.where(has_match > 0, min_dt, 0)
+                        log_min_dt = np.log1p(min_dt.astype(np.float32))
+                    else:
+                        match_1d = np.zeros(B, dtype=np.int64)
+                        match_7d = np.zeros(B, dtype=np.int64)
+                        match_30d = np.zeros(B, dtype=np.int64)
+                        log_min_dt = np.zeros(B, dtype=np.float32)
+
+                    base = pair_idx * NUM_MATCH_FEATURES_PER_PAIR
+                    match_feats[:, base + 0] = has_match
+                    match_feats[:, base + 1] = np.log1p(match_count)
+                    match_feats[:, base + 2] = np.log1p(match_1d.astype(np.float32))
+                    match_feats[:, base + 3] = np.log1p(match_7d.astype(np.float32))
+                    match_feats[:, base + 4] = np.log1p(match_30d.astype(np.float32))
+                    match_feats[:, base + 5] = log_min_dt
+
+        if match_feats is not None:
+            result['match_feats'] = torch.from_numpy(match_feats.copy())
+        else:
+            result['match_feats'] = torch.zeros(B, 0, dtype=torch.float32)
+
         return result
 
 
@@ -681,6 +846,7 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
+    match_pairs: Optional[List[Dict[str, Any]]] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -729,6 +895,7 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
+        match_pairs=match_pairs,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -751,6 +918,7 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
+        match_pairs=match_pairs,
     )
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,

@@ -19,7 +19,10 @@ from typing import List, Tuple
 import torch
 
 from utils import set_seed, EarlyStopping, create_logger
-from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
+from dataset import (
+    FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS,
+    DEFAULT_MATCH_PAIRS,
+)
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
 
@@ -194,6 +197,24 @@ def parse_args() -> argparse.Namespace:
                         help='Number of item NS tokens in rankmixer mode '
                              '(0 = automatically use the number of item groups)')
 
+    # Plan A — target item × history matching feature family.
+    parser.add_argument('--match_pairs_json', type=str, default='',
+                        help='Plan A: path to JSON listing target-item × seq '
+                             'matching pairs, e.g. '
+                             '[{"item_fid":9,"domain":"domain_d","seq_fid":19}]. '
+                             'Special value "default" loads the 3 demo-verified '
+                             'pairs hard-coded in dataset.DEFAULT_MATCH_PAIRS. '
+                             'Empty string disables Plan A.')
+    parser.add_argument('--match_inject_mode', type=str, default='ns_token',
+                        choices=['ns_token', 'qgen_cond', 'none'],
+                        help='Plan A: where to inject match_feats. '
+                             '"ns_token" (FE_A default) consumes one NS-token '
+                             'slot; "qgen_cond" (P3 / S4) feeds them as a '
+                             'condition into MultiSeqQueryGenerator without '
+                             'changing T; "none" disables match injection '
+                             '(useful for probe ablations even when '
+                             '--match_pairs_json is set).')
+
     args = parser.parse_args()
 
     # Environment variables take precedence.
@@ -253,6 +274,28 @@ def main() -> None:
             seq_max_lens[k.strip()] = int(v.strip())
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
+    # ---- Plan A: target-item × history matching pairs ----
+    match_pairs: List[dict] = []
+    if args.match_pairs_json:
+        if args.match_pairs_json == 'default':
+            match_pairs = list(DEFAULT_MATCH_PAIRS)
+            logging.info(
+                f"Plan A: loaded {len(match_pairs)} default match pairs "
+                f"from dataset.DEFAULT_MATCH_PAIRS"
+            )
+        elif os.path.exists(args.match_pairs_json):
+            with open(args.match_pairs_json, 'r') as f:
+                match_pairs = json.load(f)
+            logging.info(
+                f"Plan A: loaded {len(match_pairs)} match pairs "
+                f"from {args.match_pairs_json}"
+            )
+        else:
+            logging.warning(
+                f"--match_pairs_json={args.match_pairs_json} not found; "
+                f"Plan A disabled"
+            )
+
     logging.info("Using Parquet data format (IterableDataset)")
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
@@ -264,6 +307,7 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
+        match_pairs=match_pairs,
     )
 
     # ---- NS groups ----
@@ -316,6 +360,8 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "match_feats_dim": pcvr_dataset.match_feats_dim,
+        "match_inject_mode": args.match_inject_mode,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

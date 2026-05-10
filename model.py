@@ -13,9 +13,12 @@ class ModelInput(NamedTuple):
     item_int_feats: torch.Tensor
     user_dense_feats: torch.Tensor
     item_dense_feats: torch.Tensor
-    seq_data: dict        # {domain: tensor [B, S, L]}
-    seq_lens: dict        # {domain: tensor [B]}
+    seq_data: dict          # {domain: tensor [B, S, L]}
+    seq_lens: dict          # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Plan A — target item × history matching dense features.
+    # Shape (B, match_feats_dim); (B, 0) when Plan A is disabled.
+    match_feats: torch.Tensor = torch.empty(0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -427,14 +430,32 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        match_cond_dim: int = 0,
     ) -> None:
+        """
+        Args:
+            ...
+            match_cond_dim: when > 0, an extra ``match_feats`` tensor of shape
+                (B, match_cond_dim) is projected to d_model and concatenated
+                into ``global_info``. This is Plan A's S4 path
+                (match_inject_mode='qgen_cond'): match feats influence Q
+                generation directly without consuming an NS-token slot.
+        """
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.has_match_cond = match_cond_dim > 0
 
-        global_info_dim = (num_ns + 1) * d_model
+        # Optional match-cond projection (Plan A S4)
+        if self.has_match_cond:
+            self.match_cond_proj = nn.Sequential(
+                nn.Linear(match_cond_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
+        global_info_dim = (num_ns + 1 + (1 if self.has_match_cond else 0)) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
@@ -457,7 +478,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        match_feats: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -466,12 +488,20 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            match_feats: optional (B, match_cond_dim) tensor; required (and
+                consumed) when ``self.has_match_cond`` is True.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
         """
         B = ns_tokens.shape[0]
         ns_flat = ns_tokens.view(B, -1)  # (B, M*D)
+
+        # Project match feats once per forward (shared across sequences).
+        if self.has_match_cond:
+            assert match_feats is not None and match_feats.shape[-1] > 0, \
+                "match_feats required when MultiSeqQueryGenerator was built with match_cond_dim>0"
+            match_token = F.silu(self.match_cond_proj(match_feats))  # (B, D)
 
         q_tokens_list = []
         for i in range(self.num_sequences):
@@ -482,8 +512,11 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
             seq_pooled = seq_sum / seq_count  # (B, D)
 
-            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            # GlobalInfo_i = Concat(NS_flat, seq_pooled_i [, match_token])
+            parts = [ns_flat, seq_pooled]
+            if self.has_match_cond:
+                parts.append(match_token)
+            global_info = torch.cat(parts, dim=-1)  # (B, (M+1+has_match)*D)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -1229,6 +1262,13 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Plan A — target-item × history matching feature dim
+        match_feats_dim: int = 0,
+        # Plan A — where to inject match feats:
+        #   'ns_token' (FE_A default): consume one NS-token slot via match_proj
+        #   'qgen_cond' (P3 / S4):     condition MultiSeqQueryGenerator instead
+        #   'none':                    do not use match feats (probe-only)
+        match_inject_mode: str = 'ns_token',
     ) -> None:
         super().__init__()
 
@@ -1311,9 +1351,34 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # Plan A: target-item × history matching feature path.
+        if match_inject_mode not in ('ns_token', 'qgen_cond', 'none'):
+            raise ValueError(
+                f"match_inject_mode must be one of 'ns_token' / 'qgen_cond' / "
+                f"'none', got {match_inject_mode!r}"
+            )
+        self.match_inject_mode = match_inject_mode
+        self.match_feats_dim = match_feats_dim
+        # 'ns_token' path: consume an NS-token slot
+        self.has_match_ns_token = (
+            match_feats_dim > 0 and match_inject_mode == 'ns_token'
+        )
+        # 'qgen_cond' path: feed MultiSeqQueryGenerator as condition
+        self.has_match_qgen_cond = (
+            match_feats_dim > 0 and match_inject_mode == 'qgen_cond'
+        )
+        # Backwards-compatible flag used by forward/predict (FE_A default)
+        self.has_match_feats = self.has_match_ns_token
+        if self.has_match_ns_token:
+            self.match_proj = nn.Sequential(
+                nn.Linear(match_feats_dim, d_model),
+                nn.LayerNorm(d_model),
+            )
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if self.has_match_ns_token else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1379,12 +1444,15 @@ class PCVRHyFormer(nn.Module):
 
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
+        # When match_inject_mode='qgen_cond', match feats are concatenated to
+        # global_info inside the generator (not consumed as an NS token slot).
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
             num_ns=self.num_ns,
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            match_cond_dim=match_feats_dim if self.has_match_qgen_cond else 0,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -1645,6 +1713,9 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.has_match_feats:
+            match_tok = F.silu(self.match_proj(inputs.match_feats)).unsqueeze(1)  # (B, 1, D)
+            ns_parts.append(match_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1662,7 +1733,10 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_match = inputs.match_feats if self.has_match_qgen_cond else None
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, match_feats=q_match
+        )
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         output = self._run_multi_seq_blocks(
@@ -1688,6 +1762,9 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.has_match_feats:
+            match_tok = F.silu(self.match_proj(inputs.match_feats)).unsqueeze(1)
+            ns_parts.append(match_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
@@ -1703,7 +1780,10 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        q_match = inputs.match_feats if self.has_match_qgen_cond else None
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list, match_feats=q_match
+        )
 
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,

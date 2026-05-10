@@ -244,6 +244,16 @@ class PCVRHyFormerRankingTrainer:
            razor-close score that tripped ``is_likely_new_best`` but not
            ``EarlyStopping``'s own gate does not create a stray dir.
         """
+        # Always echo every validation result to stdout (in addition to the
+        # logger handlers configured in utils.create_logger). On platforms
+        # that only capture stdout (and not stderr where the logger's
+        # StreamHandler writes), this is the only path users see.
+        print(
+            f"[VAL] step={total_step} val_AUC={val_auc:.6f} "
+            f"val_logloss={val_logloss:.6f}",
+            flush=True,
+        )
+
         old_best = self.early_stopping.best_score
         is_likely_new_best = (
             old_best is None
@@ -285,6 +295,25 @@ class PCVRHyFormerRankingTrainer:
         ):
             self._save_step_checkpoint(
                 total_step, is_best=True, skip_model_file=True)
+            # Persist a tiny JSON next to model.pt so users can pull a single
+            # small file from the ckpt dir to read the best validation
+            # numbers without needing access to train.log.
+            metrics_path = os.path.join(best_dir, 'best_metrics.json')
+            try:
+                import json as _json
+                with open(metrics_path, 'w') as _f:
+                    _json.dump({
+                        'best_val_AUC': float(val_auc),
+                        'best_val_logloss': float(val_logloss),
+                        'global_step': int(total_step),
+                    }, _f, indent=2)
+                print(
+                    f"[VAL] new best: AUC={val_auc:.6f} → "
+                    f"{metrics_path}",
+                    flush=True,
+                )
+            except Exception as _e:
+                logging.warning(f"failed to write {metrics_path}: {_e}")
 
     def train(self) -> None:
         """Main training loop: iterates over epochs, performs step-level and
@@ -389,6 +418,15 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+        # Plan A: match_feats is always present in the dataset output
+        # (zero-dim tensor when Plan A is disabled), so pass it through
+        # unconditionally.
+        match_feats = device_batch.get('match_feats')
+        if match_feats is None:
+            match_feats = torch.zeros(
+                device_batch['user_int_feats'].shape[0], 0,
+                dtype=torch.float32, device=self.device,
+            )
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
@@ -397,6 +435,7 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            match_feats=match_feats,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:
