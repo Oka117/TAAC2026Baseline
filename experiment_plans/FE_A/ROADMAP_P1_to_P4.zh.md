@@ -234,6 +234,60 @@ P4,128, 5, qgen_cond, full,     ~327M,       ___,   ___, ___
 ✅ P4 capacity  — smoke 已跑通（CPU 1 epoch ~3 min @ batch=32），params=327,238,145
 ```
 
+---
+
+## 11. 完整训练集实测结果（P0 / P1）
+
+| Eval ID | 档 | rank_mixer_mode | user_ns | match | **Leaderboard AUC** | Δ vs baseline (0.810) | Inference (s) | 训练时长 |
+|---:|---|---|---:|:---:|---:|---:|---:|---:|
+| (anchor) | A0 (basline 已发布) | full     | 5 | none | **0.810000** *(假定)* | 0          | —      | — |
+| 78659    | **P0_calibration**  | ffn_only | 5 | none | **0.812364**       | **+0.2364 %** | 393.06 | 6 epoch |
+| 78750    | **P1_probe**        | ffn_only | 4 | none | **0.810163**       | **+0.0163 %** | 372.68 | 6 epoch |
+
+### 11.1 关键差值
+
+```text
+Δ_mode_switch = AUC(A0)  − AUC(P0)  = 0.810000 − 0.812364 = −0.2364 %
+                                       ↑ 注意是负数：ffn_only 模式比 full 模式更好
+
+Δ_5to4         = AUC(P0)  − AUC(P1)  = 0.812364 − 0.810163 = +0.2201 %
+                                       ↑ user_ns 5→4 chunk 压缩的纯成本
+```
+
+### 11.2 解读
+
+- **意外发现**：`ffn_only` 不仅没掉点，反而**比 `full` 模式高 +0.2364 % AUC**。RankMixer 的"参数无关 token-mixing reshape"在当前 d_model=64 / d_sub=4 的极薄通道下可能反而是噪声源。
+- **5→4 压缩成本被定量**：在 ffn_only 公平基准下，剥离一个 user_ns chunk 的代价是 **+0.2201 %**，**远超 §8.5 的 0.10 % 决策阈值**。
+- **两个效应几乎抵消**：P1 ≈ A0（差 0.016 %），意味着如果走 FE_A（full + user_ns=4 + match），match 信号需要先填 ~0.22 % 坑才能开始净盈余。
+
+### 11.3 决策（按 §8.5 决策门槛）
+
+```text
+Δ_5to4 = 0.2201 %  >  0.10 %  → 不走 P2，escalate 到 P3 (match 进 query_generator condition)
+```
+
+### 11.4 P2 vs P3 净 AUC 预测（结合实测 Δ_5to4）
+
+| 档 | rank_mixer | NS 池代价 | match 收益 | 预测净 ΔAUC vs A0 |
+|---|---|---:|---:|---:|
+| P2 (FE_A 主线) | full     | **−0.22 %**（实测 5→4 成本，假设跨模式可迁移）| +0.20 ~ +0.40 % | **−0.02 ~ +0.18 %** ⚠️ 高方差 |
+| **P3** (qgen_cond, full)     | full     | **0**（user_ns=5 保持） | +0.30 ~ +0.55 % | **+0.30 ~ +0.55 %** ✅ |
+| **P3'** (qgen_cond, ffn_only) | ffn_only | **0** ⊕ **+0.24 %**（继承 P0 优势） | +0.30 ~ +0.55 % | **+0.54 ~ +0.79 %** ✅✅ |
+
+> P3' 是新增的"组合配置"：把 P3 的 match→qgen_cond 设计与 P0 验证的 ffn_only 优势叠加。模型几何相同（T=16, d_model=64），只换 rank_mixer_mode。代码不需要再改。
+
+### 11.5 推荐下一步
+
+并发 2 档（你有 2 个 concurrent slot）：
+
+```text
+Job A:  P3_qgen_full     bash experiment_plans/FE_A/run_p3_qgen.sh   --num_epochs 6
+Job B:  P3_qgen_ffn_only bash experiment_plans/FE_A/run_p3_qgen.sh   --num_epochs 6 \
+                              --rank_mixer_mode ffn_only
+```
+
+跑完后 eval 复用 `infer_p0.py`（不需要改），按 train_config.json 自动重建模型。
+
 下一步建议：
 
 1. **立刻可做**：在完整训练数据上按顺序跑 A0 / P0 / P1，得到 Δ_mode_switch 与 Δ_5to4 的真实值
