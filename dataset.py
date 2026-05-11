@@ -243,6 +243,8 @@ class PCVRParquetDataset(IterableDataset):
         self._buf_user_int = np.zeros((B, self.user_int_schema.total_dim), dtype=np.int64)
         self._buf_item_int = np.zeros((B, self.item_int_schema.total_dim), dtype=np.int64)
         self._buf_user_dense = np.zeros((B, self.user_dense_schema.total_dim), dtype=np.float32)
+        # 11thMay-PlanB: item_dense path now reads from schema (was hardcoded empty)
+        self._buf_item_dense = np.zeros((B, self.item_dense_schema.total_dim), dtype=np.float32)
         self._buf_seq = {}
         self._buf_seq_tb = {}
         self._buf_seq_lens = {}
@@ -273,6 +275,14 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             ci = self._col_idx.get(f'user_dense_feats_{fid}')
             self._user_dense_plan.append((ci, dim, offset))
+            offset += dim
+
+        # 11thMay-PlanB: item_dense column plan (mirrors user_dense, was missing)
+        self._item_dense_plan = []
+        offset = 0
+        for fid, dim in self._item_dense_cols:
+            ci = self._col_idx.get(f'item_dense_feats_{fid}')
+            self._item_dense_plan.append((ci, dim, offset))
             offset += dim
 
         # Sequence column plan: {domain: ([(col_idx, feat_slot, vocab_size), ...], ts_col_idx)}
@@ -401,8 +411,13 @@ class PCVRParquetDataset(IterableDataset):
         for fid, dim in self._user_dense_cols:
             self.user_dense_schema.add(fid, dim)
 
-        # ---- item_dense (empty) ----
+        # ---- item_dense: [[fid, dim], ...] (11thMay-PlanB: was hardcoded empty;
+        # now reads optional 'item_dense' key from schema for FE-01A frequency
+        # feature item_dense_feats_86 and downstream variants).
+        self._item_dense_cols: List[List[int]] = raw.get('item_dense', [])
         self.item_dense_schema: FeatureSchema = FeatureSchema()
+        for fid, dim in self._item_dense_cols:
+            self.item_dense_schema.add(fid, dim)
 
         # ---- sequence domains ----
         self._seq_cfg: Dict[str, Dict[str, Any]] = raw['seq']
@@ -675,11 +690,19 @@ class PCVRParquetDataset(IterableDataset):
             padded = self._pad_varlen_float_column(col, dim, B)
             user_dense[:, offset:offset + dim] = padded
 
+        # ---- item_dense (11thMay-PlanB: enabled) ----
+        item_dense = self._buf_item_dense[:B]
+        item_dense[:] = 0
+        for ci, dim, offset in self._item_dense_plan:
+            col = batch.column(ci)
+            padded = self._pad_varlen_float_column(col, dim, B)
+            item_dense[:, offset:offset + dim] = padded
+
         result = {
             'user_int_feats': torch.from_numpy(user_int.copy()),
             'user_dense_feats': torch.from_numpy(user_dense.copy()),
             'item_int_feats': torch.from_numpy(item_int.copy()),
-            'item_dense_feats': torch.zeros(B, 0, dtype=torch.float32),
+            'item_dense_feats': torch.from_numpy(item_dense.copy()),
             'label': torch.from_numpy(labels),
             'timestamp': torch.from_numpy(timestamps),
             'user_id': user_ids,
