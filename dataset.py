@@ -602,11 +602,25 @@ class PCVRParquetDataset(IterableDataset):
 
     def _pad_varlen_float_column(
         self,
-        arrow_col: "pa.ListArray",
+        arrow_col: "pa.Array",
         max_dim: int,
         B: int,
     ) -> "npt.NDArray[np.float32]":
-        """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
+        """Pad an Arrow float scalar/list column to shape ``[B, max_dim]``.
+
+        11thMay-PlanB: extended to support scalar Float arrays (e.g.
+        item_dense_feats_86 written by build_feature_engineering_dataset.py
+        as flat float32) in addition to the original ListArray case used by
+        baseline user_dense columns.
+        """
+        # Scalar (non-list) float column: shape (B,) → broadcast to (B, max_dim).
+        if not pa.types.is_list(arrow_col.type):
+            arr = arrow_col.fill_null(0).to_numpy(zero_copy_only=False).astype(np.float32, copy=True)
+            padded = np.zeros((B, max_dim), dtype=np.float32)
+            if max_dim > 0:
+                padded[:, 0] = arr[:B]
+            return padded
+
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
 
